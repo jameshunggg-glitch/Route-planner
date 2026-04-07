@@ -1,0 +1,49 @@
+# 虛擬環境
+.venv/
+venv/
+
+# Python 編譯檔
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 系統檔
+.DS_Store
+Thumbs.db
+
+# IDE 設定
+.vscode/
+.idea/
+
+# 大型輸出檔（不需要上傳）
+*.html
+*.csv
+
+# ---- data lake / cache artifacts ----
+lake/
+lake/**
+
+# （可選）你的地圖輸出通常也很大
+**/*.html
+
+# （可選）常見大檔資料格式
+**/*.parquet
+**/*.pkl
+**/*.pickle
+
+# ---- AOI cache ----
+aoi_cache/
+aoi_cache/**
+
+# --- batch runs ----
+batch_runs/
+batch_runs/**
+
+# ---- gzipped pickle ----
+*.pkl.gz
+*.pickle.gz
+
+# --- Large files / notebooks you don't want in git ---
+251230_routing_net.ipynb
