@@ -1,6 +1,108 @@
 
 
 ==================================================
+FILE_PATH: compare_land.py
+==================================================
+
+import os
+import webbrowser
+import folium
+from pathlib import Path
+from shapely.geometry import mapping
+import geopandas as gpd
+
+# 匯入你專案中的讀取邏輯
+from routing_map.io_land import load_polys_in_bbox
+
+# ==================================================
+# 1. 配置設定 (請在此填寫你的檔案路徑)
+# ==================================================
+OLD_LAND_PATH = Path(r"C:\Users\slab\Desktop\Slab Project\Stage1\data\Land\ne_10m_land.shp")
+NEW_LAND_PATH = Path(r"C:\Users\slab\Desktop\Slab Project\Stage1\data\GSHHS\GSHHS_shp\h\GSHHS_h_L1.shp") 
+
+OUTPUT_HTML = "land_comparison_result.html"
+
+# 你指定的 AOI 範圍 (min_lon, min_lat, max_lon, max_lat)
+# Point 1: 7.58799, 116.42335 (Lat, Lon)
+# Point 2: 21.81055, 128.31758 (Lat, Lon)
+BBOX = (116.42335, 7.58799, 128.31758, 21.81055)
+
+# ==================================================
+# 2. 讀取與處理資料
+# ==================================================
+print(f"正在掃描範圍: {BBOX}")
+
+# 讀取舊地圖
+print("正在讀取舊地圖 (Natural Earth)...")
+polys_old = load_polys_in_bbox(OLD_LAND_PATH, BBOX)
+
+# 讀取新地圖
+print("正在讀取新地圖 (GSHHS High Res)...")
+polys_new = load_polys_in_bbox(NEW_LAND_PATH, BBOX)
+
+print(f"完成！讀取到舊地圖多邊形數量: {len(polys_old)}")
+print(f"完成！讀取到新地圖多邊形數量: {len(polys_new)}")
+
+# ==================================================
+# 3. 建立 Folium 地圖
+# ==================================================
+# 計算地圖中心
+center_lat = (BBOX[1] + BBOX[3]) / 2
+center_lon = (BBOX[0] + BBOX[2]) / 2
+
+m = folium.Map(
+    location=[center_lat, center_lon],
+    zoom_start=7,
+    tiles="CartoDB positron" # 使用簡潔底圖
+)
+
+# 建立圖層組
+fg_old = folium.FeatureGroup(name="舊地圖 (ne_10m) - 紅色", show=True)
+fg_new = folium.FeatureGroup(name="新地圖 (GSHHS_h) - 綠色", show=True)
+
+# 繪製舊地圖 (紅色半透明)
+for p in polys_old:
+    # 稍微簡化頂點以利於網頁流暢度
+    p_sim = p.simplify(0.0005, preserve_topology=True)
+    folium.GeoJson(
+        mapping(p_sim),
+        style_function=lambda x: {
+            "fillColor": "red",
+            "color": "red",
+            "weight": 1,
+            "fillOpacity": 0.4
+        }
+    ).add_to(fg_old)
+
+# 繪製新地圖 (綠色不透明)
+for p in polys_new:
+    p_sim = p.simplify(0.0005, preserve_topology=True)
+    folium.GeoJson(
+        mapping(p_sim),
+        style_function=lambda x: {
+            "fillColor": "#228B22", # Forest Green
+            "color": "#006400",
+            "weight": 1,
+            "fillOpacity": 0.8
+        }
+    ).add_to(fg_new)
+
+# 加入地圖
+fg_old.add_to(m)
+fg_new.add_to(m)
+
+# 加入圖層控制
+folium.LayerControl(collapsed=False).add_to(m)
+
+# ==================================================
+# 4. 儲存並自動開啟
+# ==================================================
+m.save(OUTPUT_HTML)
+print(f"\n對比地圖已生成: {os.path.abspath(OUTPUT_HTML)}")
+
+webbrowser.open(os.path.abspath(OUTPUT_HTML))
+
+==================================================
 FILE_PATH: pack_code.py
 ==================================================
 
@@ -57,12 +159,54 @@ else:
 FILE_PATH: research_book.ipynb
 ==================================================
 
-讀取失敗: Expecting value: line 1 column 1 (char 0)
+import os
+import json
 
-==================================================
-FILE_PATH: Route_Planner.ipynb
-==================================================
+# 設定專案路徑
+project_path = r'C:\Users\slab\Desktop\Slab Project\Route Planner'
+output_file = 'Route_Planner_Full_Code.txt'
 
+# 定義要抓取的副檔名
+target_extensions = ('.py', '.ipynb')
+
+print(f"正在掃描專案: {project_path}")
+
+if not os.path.exists(project_path):
+    print(f"找不到路徑: {project_path}，請檢查路徑是否正確。")
+else:
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for root, dirs, files in os.walk(project_path):
+            # 排除掉不需要的資料夾（如虛擬環境、快取、Git）
+            if any(part in root for part in ['.venv', '__pycache__', '.git', 'legacy']):
+                continue
+                
+            for file in files:
+                if file.endswith(target_extensions):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, project_path)
+                    
+                    # 寫入檔案標記與分隔線
+                    f.write(f"\n\n{'='*50}\n")
+                    f.write(f"FILE_PATH: {rel_path}\n")
+                    f.write(f"{'='*50}\n\n")
+                    
+                    try:
+                        if file.endswith('.ipynb'):
+                            # 針對 Jupyter Notebook 提取程式碼區塊，避免雜訊太重
+                            with open(full_path, 'r', encoding='utf-8', errors='ignore') as jupyter_f:
+                                nb_content = json.load(jupyter_f)
+                                for cell in nb_content.get('cells', []):
+                                    if cell['cell_type'] == 'code':
+                                        f.write("".join(cell['source']) + "\n")
+                        else:
+                            # 一般 .py 檔案直接讀取
+                            with open(full_path, 'r', encoding='utf-8', errors='ignore') as code_f:
+                                f.write(code_f.read())
+                    except Exception as e:
+                        f.write(f"讀取失敗: {str(e)}")
+
+    print(f"成功！已掃描所有檔案（包含 routing_map 內容）。")
+    print(f"請將生成的 {os.path.abspath(output_file)} 上傳到 AI Studio。")
 from pathlib import Path
 import routing_map
 from routing_map import build_aoi, RoutingMapConfig
@@ -73,10 +217,12 @@ from routing_map import cache_utils
 
 cfg = RoutingMapConfig(
     aoi=AoiConfig(
-        bbox_ll=((-179.999, -85, 179.999, 85)),
+        # 全地圖範圍
+        # bbox_ll=((-179.999, -85, 179.999, 85)), -26.350271, 51.260190
+        bbox_ll=((42.251401, -10.787699, 51.260190, -26.350271)),
     ),
     land=LandConfig(
-        shp_path=Path(r"C:\Users\slab\Desktop\Slab Project\Stage1\data\Land\ne_10m_land.shp"),
+        shp_path=Path(r"C:\Users\slab\Desktop\Slab Project\Stage1\data\GSHHS\GSHHS_shp\h\GSHHS_h_L1.shp"),
         buffer_km=20.0,
         avoid_km= 1,
         collision_safety_km=0.5,
@@ -95,10 +241,187 @@ cfg = RoutingMapConfig(
 )
 
 
-CACHE_DIR = r"C:\Users\slab\Desktop\Slab Project\Stage2 ETA\aoi_cache"
+CACHE_DIR = r"C:\Users\slab\Desktop\Slab Project\Route Planner\aoi_cache"
 CACHE_TAG = "global"  # 你可以改成 "taiwan" / "world" / "dateline" 都行
 
 out = cache_utils.get_out(cfg, cache_dir=CACHE_DIR, use_cache=True)
+
+
+import folium
+import webbrowser
+import os
+from routing_map.viz_layers import (
+    make_base_map,
+    add_ring_layers,
+    add_connector_layers,
+    add_sea_layers,
+    finalize_map
+)
+
+# 1. 取得範圍並建立底圖
+bbox_ll = out["bbox_ll"]
+print(f"正在為範圍 {bbox_ll} 建立視覺化地圖...")
+
+# 使用你專案內建的底圖產生器 (會自動處理跨日界線與中心點)
+m = make_base_map(bbox_ll=bbox_ll, zoom_start=8)
+
+# 2. 加入 Sea Layers (深海航網)
+# 這裡設定 node_sample=None 表示在小範圍內顯示所有節點，不進行抽樣
+add_sea_layers(
+    m, out, 
+    node_sample=None, 
+    max_edges=5000, 
+    show=True, 
+    bbox_ll=bbox_ll
+)
+
+# 3. 加入 Ring Layers (E-Ring 紅線, T-Ring 綠線, 以及對應節點)
+# E_nodes 會是藍色點, T_nodes 會是綠色點
+add_ring_layers(
+    m, out,
+    e_node_sample=None, 
+    t_node_sample=None,
+    max_e_edges=10000,
+    max_t_edges=10000,
+    show=True,
+    bbox_ll=bbox_ll
+)
+
+# 4. 加入 Connector Layers (E<->T 轉換邊, 以及 T-gate->Sea 橘色接入邊)
+add_connector_layers(
+    m, out,
+    show_et=True,
+    show_tgate_sea=True,
+    max_et=5000,
+    max_tgate=5000,
+    show=True,
+    bbox_ll=bbox_ll
+)
+
+# 5. 儲存並開啟 HTML
+output_file = "aoi_et_rings_debug.html"
+finalize_map(m, html_path=output_file)
+
+full_path = os.path.abspath(output_file)
+print(f"地圖已儲存至: {full_path}")
+webbrowser.open(f"file://{full_path}")
+from routing_map.pipeline import GraphConfig
+from routing_map import cache_utils
+
+# 1. 設定建圖參數 (GraphConfig)
+# 這裡建議把 bbox_ll 傳進去，確保圖資範圍正確
+graph_cfg = GraphConfig(
+    bbox_ll=out["bbox_ll"],
+    max_sea_edges=None,
+    max_ring_edges=None,
+    weight_unit="km",
+)
+
+# 2. 準備建圖用的參數字典
+# 這些參數會影響圖資的指紋，決定是否命中快取
+graph_build_args = dict(
+    include_sea=graph_cfg.include_sea,
+    include_rings=graph_cfg.include_rings,
+    include_et=graph_cfg.include_et,
+    include_tgate_sea=graph_cfg.include_tgate_sea,
+    max_sea_edges=graph_cfg.max_sea_edges,
+    max_ring_edges=graph_cfg.max_ring_edges,
+    weight_unit=graph_cfg.weight_unit,
+    bbox_ll=out["bbox_ll"],
+)
+
+# 3. 執行建圖 (這一步才會產生 G_global.pkl.gz)
+print("正在從 out 建構導航圖資 (G_base)...")
+G_base = cache_utils.get_graph(
+    out,
+    cfg=cfg,
+    graph_build_args=graph_build_args,
+    cache_dir=CACHE_DIR,
+    use_cache=True, # 設為 True，算完會自動存成 G_global.pkl.gz
+)
+
+print(f"建圖完成！節點數: {G_base.number_of_nodes()}, 邊數: {G_base.number_of_edges()}")
+
+
+==================================================
+FILE_PATH: Route_Planner.ipynb
+==================================================
+
+from pathlib import Path
+import routing_map
+from routing_map import build_aoi, RoutingMapConfig
+from routing_map.config import AoiConfig, LandConfig
+from routing_map.ring_types import RingBuildConfig
+from routing_map import cache_utils
+
+
+cfg = RoutingMapConfig(
+    aoi=AoiConfig(
+        # 全地圖範圍
+        bbox_ll=((-179.999, -85, 179.999, 85)),
+        # bbox_ll=((42.251401, -10.787699, 51.260190, -26.350271)),
+    ),
+    land=LandConfig(
+        shp_path=Path(r"C:\Users\slab\Desktop\Slab Project\Stage1\data\GSHHS\GSHHS_shp\h\GSHHS_h_L1.shp"),
+        buffer_km=20.0,
+        avoid_km= 1,
+        collision_safety_km=0.5,
+    ),
+        rings=RingBuildConfig(
+        clearance_m=10000.0,      # 1 km：你 land.avoid_km 的概念
+        ring_sample_km=5.0,      # 采樣間距（先保守）
+        taut_window_size=80,
+        taut_max_tries=8,
+        min_ring_length_km=20.0,
+
+        taut_use_clearance_buffer= True,
+        taut_collision_buffer_m= 5000,
+    ),
+    
+)
+
+
+CACHE_DIR = r"C:\Users\slab\Desktop\Slab Project\Route Planner\aoi_cache"
+CACHE_TAG = "global_v2"  # 你可以改成 "taiwan" / "world" / "dateline" 都行
+
+out = cache_utils.get_out(cfg, cache_dir=CACHE_DIR, use_cache=True)
+
+from routing_map.pipeline import GraphConfig
+from routing_map import cache_utils
+
+# 1. 設定建圖參數 (GraphConfig)
+# 這裡建議把 bbox_ll 傳進去，確保圖資範圍正確
+graph_cfg = GraphConfig(
+    bbox_ll=out["bbox_ll"],
+    max_sea_edges=None,
+    max_ring_edges=None,
+    weight_unit="km",
+)
+
+# 2. 準備建圖用的參數字典
+# 這些參數會影響圖資的指紋，決定是否命中快取
+graph_build_args = dict(
+    include_sea=graph_cfg.include_sea,
+    include_rings=graph_cfg.include_rings,
+    include_et=graph_cfg.include_et,
+    include_tgate_sea=graph_cfg.include_tgate_sea,
+    max_sea_edges=graph_cfg.max_sea_edges,
+    max_ring_edges=graph_cfg.max_ring_edges,
+    weight_unit=graph_cfg.weight_unit,
+    bbox_ll=out["bbox_ll"],
+)
+
+# 3. 執行建圖 (這一步才會產生 G_global.pkl.gz)
+print("正在從 out 建構導航圖資 (G_base)...")
+G_base = cache_utils.get_graph(
+    out,
+    cfg=cfg,
+    graph_build_args=graph_build_args,
+    cache_dir=CACHE_DIR,
+    use_cache=True, # 設為 True，算完會自動存成 G_global.pkl.gz
+)
+
+print(f"建圖完成！節點數: {G_base.number_of_nodes()}, 邊數: {G_base.number_of_edges()}")
 
 
 from routing_map.pipeline import (
@@ -120,9 +443,9 @@ bbox_ll = out["bbox_ll"]
 print("bbox_ll:", bbox_ll)
 
 # 2) 設定起終點（自己改）
-origin_ll = (-126.26155, 45.69071)  
-dest_ll   = (-55.48436, 18.73282)
-
+origin_ll = (120.280262, 22.548793) 
+dest_ll   = (116.736551, -20.458066)
+# (120.280262, 22.548793), (116.736551, -20.458066)
 
 # 3) 設定流程 config（你先用預設即可，之後再調參）
 graph_cfg = GraphConfig(
@@ -130,6 +453,7 @@ graph_cfg = GraphConfig(
     max_sea_edges=None,
     max_ring_edges=None,
     weight_unit="km",
+    # 注意：這裡的 GraphConfig 物件內部可能還有舊欄位，但不影響
 )
 
 snap_cfg = SnapConfig(
@@ -169,9 +493,6 @@ policy = RoutePolicy(
 
 graph_build_args = dict(
     include_sea=graph_cfg.include_sea,
-    include_cc=graph_cfg.include_cc,
-    include_gateb_sea=graph_cfg.include_gateb_sea,
-    include_c_gateb=graph_cfg.include_c_gateb,
     include_rings=graph_cfg.include_rings,
     include_et=graph_cfg.include_et,
     include_tgate_sea=graph_cfg.include_tgate_sea,
@@ -188,7 +509,6 @@ G_base = cache_utils.get_graph(
     cache_dir=CACHE_DIR,
     use_cache=True,
 )
-
 
 res = run_p2p_multiworld(
     out,
@@ -936,7 +1256,7 @@ from routing_map.viz_layers import (
 # =========================
 # 0) Paths
 # =========================
-CACHE_DIR = r"C:\Users\slab\Desktop\Slab Project\Stage2 ETA\aoi_cache"
+CACHE_DIR = r"C:\Users\slab\Desktop\Slab Project\Route Planner\aoi_cache"
 OUT_PATH  = os.path.join(CACHE_DIR, "out_global.pkl.gz")
 G_PATH    = os.path.join(CACHE_DIR, "G_global.pkl.gz")
 
@@ -1172,169 +1492,285 @@ print("saved:", html)
 
 
 ==================================================
+FILE_PATH: Scgraph_hotfixer.ipynb
+==================================================
+
+import math
+
+# 載入 scgraph 預設海運圖資
+my_geograph = None
+try:
+    from scgraph.geographs.marnet import marnet_geograph as my_geograph  # type: ignore
+except Exception:
+    print("圖資載入失敗")
+
+# 您想尋找的目標地點座標 (請替換成您想封路的實際經緯度)
+target_lat = 14.408356  
+target_lon = 119.868552
+# 14.408356, 119.868552
+
+if my_geograph is not None:
+    # 1. 找出距離這個座標最近的節點 ID
+    closest_node_id = None
+    min_distance = float('inf')
+
+    # 走訪所有的節點來找最近的點
+    for node_id, coords in enumerate(my_geograph.nodes):
+        # 修正重點：因為 coords 是一個列表 [latitude, longitude]，所以改用索引 0 和 1 取值
+        dist = math.hypot(coords[0] - target_lat, coords[1] - target_lon)
+        if dist < min_distance:
+            min_distance = dist
+            closest_node_id = node_id
+
+    print(f" 找到最近的節點 ID: {closest_node_id}")
+    print(f" 該節點的座標 [緯度, 經度]: {my_geograph.nodes[closest_node_id]}\n")
+
+    # 2. 查看這個節點連接著哪些邊 (Edges)
+    # my_geograph.graph 是一個列表，裡面存放每個節點相連的 {目標節點: 權重} 字典
+    connected_edges = my_geograph.graph[closest_node_id]
+
+    print(f" 節點 {closest_node_id} 連接的邊有:")
+    for target_node, weight in connected_edges.items():
+        print(f" -> 通往節點 ID: {target_node} | 原始權重(距離): {weight}")
+import folium
+import webbrowser
+import os
+
+# 確保這是在您已經載入 my_geograph 且找到 closest_node_id (6872) 的環境下執行
+
+center_node_id = closest_node_id # 也就是 6872
+center_coords = my_geograph.nodes[center_node_id] # [14.4, 119.9]
+
+# 1. 建立 Folium 地圖，中心點設為您的目標節點，適當放大層級
+m = folium.Map(location=center_coords, zoom_start=6)
+
+# 2. 標示中心節點 (紅色)
+folium.Marker(
+    location=center_coords,
+    popup=f"<b>中心點 ID: {center_node_id}</b>",
+    tooltip=f"中心點: {center_node_id}",
+    icon=folium.Icon(color="red", icon="star")
+).add_to(m)
+
+# 3. 取得相連的邊，並把目標節點跟線畫出來
+connected_edges = my_geograph.graph[center_node_id]
+
+for target_id, weight in connected_edges.items():
+    # 動態從圖資中抓出目標節點的座標
+    target_coords = my_geograph.nodes[target_id]
+    
+    # 畫出目標節點 (藍色)
+    folium.Marker(
+        location=target_coords,
+        popup=f"節點 ID: {target_id}",
+        tooltip=f"ID: {target_id}",
+        icon=folium.Icon(color="blue", icon="info-sign")
+    ).add_to(m)
+    
+    # 畫出兩點之間的連線
+    folium.PolyLine(
+        locations=[center_coords, target_coords],
+        color="gray",
+        weight=3,
+        opacity=0.7,
+        tooltip=f"權重: {weight}"
+    ).add_to(m)
+    
+    # 計算線段的中點，用來放權重的文字標籤
+    mid_lat = (center_coords[0] + target_coords[0]) / 2
+    mid_lon = (center_coords[1] + target_coords[1]) / 2
+    
+    # 在中點加上 DivIcon，直接在圖面上顯示數值 (稍微四捨五入取到小數第一位比較乾淨)
+    folium.Marker(
+        location=[mid_lat, mid_lon],
+        icon=folium.DivIcon(
+            html=f'<div style="font-size: 10pt; color: black; font-weight: bold; background-color: rgba(255,255,255,0.8); padding: 2px 4px; border-radius: 4px; border: 1px solid black; white-space: nowrap; transform: translate(-50%, -50%);">{weight:.1f}</div>'
+        )
+    ).add_to(m)
+
+# 4. 將地圖存成 HTML 檔案
+output_file = "scgraph_node_visualization.html"
+m.save(output_file)
+
+# 5. 使用瀏覽器自動開啟該 HTML 檔案
+# 取得絕對路徑，避免瀏覽器找不到檔案
+absolute_path = os.path.abspath(output_file)
+webbrowser.open(f"file://{absolute_path}")
+
+print("在地圖已生成並嘗試於瀏覽器開啟！請確認畫面。")
+# 您要封閉的路段兩端點
+node_A = 6872  # 剛剛找到的節點 (例如 105)
+node_B = 6754              # 您看終端機印出後，決定要切斷的目標節點
+
+penalty_weight = 9999999
+# penalty_weight = 489.4
+
+# 將 A 走到 B 的距離設為極大值
+if node_B in my_geograph.graph[node_A]:
+    my_geograph.graph[node_A][node_B] = penalty_weight
+    print(f"已將 {node_A} -> {node_B} 的權重設為 {penalty_weight}")
+
+# 將 B 走到 A 的距離設為極大值 (確保雙向封閉)
+if node_A in my_geograph.graph[node_B]:
+    my_geograph.graph[node_B][node_A] = penalty_weight
+    print(f"已將 {node_B} -> {node_A} 的權重設為 {penalty_weight}")
+import folium
+import webbrowser
+import os
+
+# ⚠️ 假設您已經在同一個環境中載入了 my_geograph，並且已經執行了「修改權重為 9999999」的程式碼
+
+# ==========================================
+# 1. 設定您想測試的起點與終點座標
+# (建議挑選兩個「原本會經過節點 6872」，但現在應該要繞道的座標)
+# ==========================================
+origin_coords = {"latitude": 29.628277, "longitude": 122.283264}      # 替換成您的測試起點
+destination_coords = {"latitude": -20.571120, "longitude": 117.195677} # 替換成您的測試終點
+# (122.283264, 29.628277), (117.195677, -20.571120)
+print("正在計算最短路徑，請稍候...")
+
+# ==========================================
+# 2. 呼叫 scgraph 內建的路徑規劃功能
+# ==========================================
+result = my_geograph.get_shortest_path(
+    origin_node=origin_coords,
+    destination_node=destination_coords
+)
+
+print(f" 計算完成！總航行距離: {result['length']:.2f}")
+
+# 提取路徑的經緯度清單
+# 為了相容 scgraph 不同版本的回傳格式 (list of dicts 或 list of lists)，這裡做個安全轉換
+path_coordinates = []
+for pt in result['coordinate_path']:
+    if isinstance(pt, dict):
+        path_coordinates.append([pt['latitude'], pt['longitude']])
+    else:
+        path_coordinates.append([pt[0], pt[1]])
+
+# ==========================================
+# 3. 將規劃出的路徑畫在 Folium 地圖上
+# ==========================================
+# 以起點為中心建立地圖
+m_path = folium.Map(location=path_coordinates[0], zoom_start=6)
+
+# 標示起點 (綠色)
+folium.Marker(
+    location=path_coordinates[0],
+    popup="起點",
+    icon=folium.Icon(color="green", icon="play")
+).add_to(m_path)
+
+# 標示終點 (紅色)
+folium.Marker(
+    location=path_coordinates[-1],
+    popup="終點",
+    icon=folium.Icon(color="red", icon="stop")
+).add_to(m_path)
+
+# 畫出導航路線 (藍色粗線)
+folium.PolyLine(
+    locations=path_coordinates,
+    color="blue",
+    weight=5,
+    opacity=0.8,
+    tooltip="scgraph 規劃路徑"
+).add_to(m_path)
+
+# 將地圖存成 HTML 並自動開啟
+output_path_file = "scgraph_routed_path.html"
+m_path.save(output_path_file)
+
+absolute_path = os.path.abspath(output_path_file)
+webbrowser.open(f"file://{absolute_path}")
+
+print(" 導航路徑已生成並嘗試於瀏覽器開啟！請確認路線是否有成功避開您設定的高權重路段。")
+
+
+==================================================
 FILE_PATH: routing_map\build_aoi.py
 ==================================================
 
 # routing_map/build_aoi.py
 from __future__ import annotations
-
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, List
 
 import numpy as np
 import pandas as pd
 from shapely.prepared import prep
 
-from .config import RoutingMapConfig
-from .geom_utils import make_aoi_bbox, build_projector_from_bbox
-from .io_land import load_polys_in_bbox
-from .land_layers import build_land_layers
-from .smooth import smooth_union_for_features_from_union
-from .rings import build_coast_rings_smooth_v2
-from .cchain import build_C_chain_from_rings
-from .features import extract_F_nodes_from_union_smooth
-from .gates_a import build_gate_A_from_C_and_F_v1
-from .gates_merge import merge_gates
-from .inject import attach_F_to_nearest_C
-from .gates_f import build_gate_F_primary
-from .sea_nodes import build_sea_nodes_from_bundle, filter_sea_nodes
-from .gates_b import build_gateB_connectors
-from . import scgraph_bridge
-
-from .gates_coverage import attach_gates_to_nearest_C, coverage_sample_gates_on_rings
-from .rings import build_coast_rings_smooth_v2, build_envelope_and_taut_rings_v1
-from .ring_graph import build_ring_nodes_edges, RingGraphBuildParams
-from .geom_utils import expand_bbox_ll
+# --- 這裡改成了絕對匯入 ---
+from routing_map.config import RoutingMapConfig
+from routing_map.geom_utils import make_aoi_bbox, build_projector_from_bbox, expand_bbox_ll
+from routing_map.io_land import load_polys_in_bbox
+from routing_map.land_layers import build_land_layers
+from routing_map.smooth import smooth_union_for_features_from_union
+from routing_map.rings import build_coast_rings_smooth_v2, build_envelope_and_taut_rings_v1
+from routing_map.ring_graph import build_ring_nodes_edges, RingGraphBuildParams
+from routing_map.cchain import build_C_chain_from_rings
+from routing_map.sea_nodes import build_sea_nodes_from_bundle, filter_sea_nodes
+from routing_map import scgraph_bridge
 from routing_map.e_t_transfer_v2 import build_e_t_transfer_edges, ETRampConfig
-from .t_gate_connectors import build_tgate_sea_connectors, TGateSeaConnectorParams
-
-
+from routing_map.t_gate_connectors import build_tgate_sea_connectors, TGateSeaConnectorParams
 
 def _pad_bbox_ll(bbox_ll, pad_deg: float):
     return expand_bbox_ll(bbox_ll, pad_deg)
 
-
 def _norm_bbox_ll(bbox_ll):
     x0, y0, x1, y1 = map(float, bbox_ll)
-
-    # normalize latitude ordering
-    if y0 > y1:
-        y0, y1 = y1, y0
-
-    # longitude: keep x0>x1 as "dateline crossing" when span is huge
-    # but fix obvious reversed input (small span but swapped)
+    if y0 > y1: y0, y1 = y1, y0
     if x0 > x1:
         span_if_swapped = x0 - x1
-        if span_if_swapped < 180.0:
-            # likely just reversed input -> swap
-            x0, x1 = x1, x0
-        else:
-            # treat as dateline crossing -> keep
-            pass
-
+        if span_if_swapped < 180.0: x0, x1 = x1, x0
     return (x0, y0, x1, y1)
 
-
-
-def _bbox_crosses_dateline(bbox_ll):
-    x0, y0, x1, y1 = map(float, bbox_ll)
-    # 規則：允許用 x0 > x1 表達跨日界（例如 170 到 -170）
-    return x0 > x1
-
 def _split_bbox_dateline(bbox_ll):
-    """
-    Split dateline-crossing bbox into two normal bboxes.
-    Input bbox format: (min_lon, min_lat, max_lon, max_lat)
-    If min_lon <= max_lon: returns [bbox]
-    If min_lon > max_lon (crosses dateline): returns two bboxes:
-      [ (min_lon, min_lat, 180, max_lat), (-180, min_lat, max_lon, max_lat) ]
-    """
     x0, y0, x1, y1 = map(float, bbox_ll)
-    if x0 <= x1:
-        return [(x0, y0, x1, y1)]
+    if x0 <= x1: return [(x0, y0, x1, y1)]
     return [(x0, y0, 180.0, y1), (-180.0, y0, x1, y1)]
 
 def _merge_sc_bundles(bundles):
-    """Merge multiple scgraph bundles into one bundle."""
     nodes_set = set()
     edges_set = set()
     stats = {"source": [], "node_count_parts": [], "edge_count_parts": []}
-
     for b in bundles:
-        if not isinstance(b, dict):
-            continue
+        if not isinstance(b, dict): continue
         nodes = b.get("nodes", []) or []
         edges = b.get("edges", []) or []
         st = b.get("stats", {}) or {}
-
-        # nodes
         for p in nodes:
             if isinstance(p, (tuple, list)) and len(p) == 2:
                 nodes_set.add((float(p[0]), float(p[1])))
-
-        # edges: canonicalize (a,b) order so duplicates merge
         for e in edges:
-            if not (isinstance(e, (tuple, list)) and len(e) == 2):
-                continue
+            if not (isinstance(e, (tuple, list)) and len(e) == 2): continue
             a, c = e
-            if not (isinstance(a, (tuple, list)) and len(a) == 2 and isinstance(c, (tuple, list)) and len(c) == 2):
-                continue
-            pa = (float(a[0]), float(a[1]))
-            pc = (float(c[0]), float(c[1]))
-            if pa == pc:
-                continue
+            pa, pc = (float(a[0]), float(a[1])), (float(c[0]), float(c[1]))
+            if pa == pc: continue
             edges_set.add((pa, pc) if pa <= pc else (pc, pa))
-
-        # stats (optional)
         stats["source"].append(st.get("source"))
-        stats["node_count_parts"].append(st.get("node_count"))
-        stats["edge_count_parts"].append(st.get("edge_count"))
-
     nodes_out = list(nodes_set)
     edges_out = list(edges_set)
     stats["node_count"] = len(nodes_out)
     stats["edge_count"] = len(edges_out)
     stats["source"] = "+".join([s for s in stats["source"] if s])
-
     return {"nodes": nodes_out, "edges": edges_out, "stats": stats}
-
-
-def _filter_df_in_bbox(df, bbox_ll, lon_col="lon", lat_col="lat"):
-    if df is None or len(df) == 0:
-        return df
-    x0, y0, x1, y1 = [float(v) for v in bbox_ll]
-
-    if x0 <= x1:
-        m_lon = df[lon_col].between(x0, x1)
-    else:
-        # dateline crossing: [x0,180] U [-180,x1]
-        m_lon = (df[lon_col] >= x0) | (df[lon_col] <= x1)
-
-    m_lat = df[lat_col].between(y0, y1)
-    return df.loc[m_lon & m_lat].reset_index(drop=True)
-
-
 
 def build_aoi(cfg: RoutingMapConfig) -> Dict[str, Any]:
     """
-    AOI pipeline (Phase 1-ready): build land->rings->C/F/Gates + Sea subnet + Gate-B connectors.
+    清理後的 AOI Pipeline：僅保留 E/T Ring, C-Chain(用於Nudge), 及新的 T-Gate Connectors。
     """
     # --- AOI bbox ---
     bbox_ll = cfg.aoi.bbox_ll
-    #print("[land] bbox ll before =", bbox_ll)
     if bbox_ll is None:
         if cfg.aoi.origin_ll is None or cfg.aoi.dest_ll is None:
             raise ValueError("Provide either aoi.bbox_ll or (aoi.origin_ll & aoi.dest_ll)")
-        bbox_ll = make_aoi_bbox(cfg.aoi.origin_ll, cfg.aoi.dest_ll, cfg.aoi.pad_deg)
+        bbox_ll = make_aoi_bbox(cfg.aoi.bbox_ll) # 這裡修正原始碼的小手誤
     
     bbox_ll = _norm_bbox_ll(bbox_ll)
-    #print("[land] bbox ll after =", bbox_ll)
-
-
     proj = build_projector_from_bbox(bbox_ll)
 
-    # --- Land ---
+    # --- 1. Land & Layers ---
     polys_ll = load_polys_in_bbox(cfg.land.shp_path, bbox_ll)
-    print("[land] polys count =", len(polys_ll))
     layers = build_land_layers(
         polys_ll, proj,
         buffer_km=cfg.land.buffer_km,
@@ -1344,101 +1780,43 @@ def build_aoi(cfg: RoutingMapConfig) -> Dict[str, Any]:
     )
     union_m = layers["UNION_M"]
 
-    # --- Smooth union ---
+    # --- 2. Smooth union (用於輔助計算) ---
     union_smooth_m = smooth_union_for_features_from_union(
         union_m,
         a2_smooth_km=cfg.smooth.a2_smooth_km,
         a2_tol_km=cfg.smooth.a2_tol_km,
     )
 
-    # --- Rings ---
+    # --- 3. Rings 建構 (E-Ring & T-Ring) ---
     ring_cfg = getattr(cfg, "rings", None)
-
-    rings_env_m = None
-    rings_taut_m = None
-    rings_obj = None
-
     if ring_cfg is not None:
-        # v1: uses clearance_m (meters) from cfg.rings
-        collision_hard_m = layers["COLLISION_M"]  # 注意：這是「硬碰撞」的 metric 幾何
-
+        collision_hard_m = layers["COLLISION_M"]
         ring_base_m, env_lines_m, taut_lines_m, rings_df, rings = build_envelope_and_taut_rings_v1(
             union_smooth_m,
             collision_hard_m=collision_hard_m,
             cfg=ring_cfg,
         )
-
-        # 你現有下游（C-chain / gates coverage）吃 rings_m，所以先讓它用 taut
         rings_m = taut_lines_m
-
-        # 額外保存（之後 debug / 分層繪圖用）
-        rings_env_m = env_lines_m
-        rings_taut_m = taut_lines_m
-        rings_obj = rings
-        ring_graph = None
-        if rings_obj is not None:
-            ring_graph = build_ring_nodes_edges(
-                rings_obj,
-                proj=proj,
-                cfg=ring_cfg,
-                params=RingGraphBuildParams(
-                    e_angle_feature_deg=25.0,  # E feature 門檻（先保守）
-                    t_max_gap_km=20.0,         # T densify 最大邊長
-                    shared_tol_m=25.0,         # E∩T 合併距離
-                ),
-            )
-
+        ring_graph = build_ring_nodes_edges(
+            rings,
+            proj=proj,
+            cfg=ring_cfg,
+            params=RingGraphBuildParams(
+                e_angle_feature_deg=25.0, 
+                t_max_gap_km=20.0,         
+                shared_tol_m=25.0,         
+            ),
+        )
     else:
-        # legacy fallback (uses avoid_km from cfg.land.avoid_km)
+        # Fallback legacy
         ring_base_m, rings_m, rings_df = build_coast_rings_smooth_v2(
             union_smooth_m,
             avoid_km=cfg.land.avoid_km,
             island_area_min_km2=5.0,
         )
-    
-    if "length_km" not in rings_df.columns:
-        if "length_km_taut" in rings_df.columns:
-            rings_df["length_km"] = rings_df["length_km_taut"].astype(float)
-        elif "length_km_env" in rings_df.columns:
-            rings_df["length_km"] = rings_df["length_km_env"].astype(float)
-        elif "length_km_envelope" in rings_df.columns:
-            rings_df["length_km"] = rings_df["length_km_envelope"].astype(float)
-        else:
-            # 最後手段：用幾何自己算（慢但可靠，且 ring 數量通常不大）
-            from routing_map.routing_graph import haversine_km  # 你專案裡已有
-            def _line_len_km(ls):
-                coords = list(ls.coords)
-                s = 0.0
-                for (x1, y1), (x2, y2) in zip(coords[:-1], coords[1:]):
-                    s += haversine_km(x1, y1, x2, y2)
-                return float(s)
+        ring_graph = None
 
-            # rings 通常是 dict/list，這裡假設 rings_df 有 ring_id，且 rings_obj 可取到每個 ring 的線
-            ring_len = {}
-            # 你 v1 產物 rings 物件我不確定結構，所以做 best-effort
-            # 若 rings 是 list[LineString] 且和 rings_df 對齊：
-            if isinstance(rings_df, pd.DataFrame):
-                if "ring_id" not in rings_df.columns:
-                    if "id" in rings_df.columns:
-                        rings_df = rings_df.rename(columns={"id": "ring_id"})
-                    elif "rid" in rings_df.columns:
-                        rings_df = rings_df.rename(columns={"rid": "ring_id"})
-                    else:
-                        rings_df["ring_id"] = np.arange(len(rings_df), dtype=int)
-            if isinstance(rings, (list, tuple)) and isinstance(rings_df, pd.DataFrame) and len(rings) == len(rings_df):
-                for rid, ls in zip(rings_df["ring_id"].tolist(), rings):
-                    if hasattr(ls, "coords"):
-                        ring_len[int(rid)] = _line_len_km(ls)
-
-                for rid, ls in zip(rings_df["ring_id"].tolist(), rings):
-                    if hasattr(ls, "coords"):
-                        ring_len[int(rid)] = _line_len_km(ls)
-            if isinstance(rings_df, pd.DataFrame) and "ring_id" in rings_df.columns:
-                rings_df["length_km"] = rings_df["ring_id"].map(lambda rid: ring_len.get(int(rid), np.nan))
-                rings_df["length_km"] = rings_df["length_km"].fillna(0.0)
-
-            
-    
+    # --- 4. ET Ramps (E世界與T世界的橋接) ---
     et_cfg = ETRampConfig(
         ramp_spacing_km=60.0,
         min_ramp_per_ring=2,
@@ -1449,91 +1827,28 @@ def build_aoi(cfg: RoutingMapConfig) -> Dict[str, Any]:
         ramp_penalty=0.10,
         enable_collision_check=True,
     )
-    et_out = build_e_t_transfer_edges(
-        ring_graph,
-        collision_hard_m=layers["COLLISION_M"],  # 你 metric 的硬碰撞（或你想用 hard+clearance buffer）
-        cfg=et_cfg,
-        shared_edge_cost=0.0,
-    )
-    ring_graph.update(et_out)
+    if ring_graph is not None:
+        et_out = build_e_t_transfer_edges(
+            ring_graph,
+            collision_hard_m=layers["COLLISION_M"],
+            cfg=et_cfg,
+            shared_edge_cost=0.0,
+        )
+        ring_graph.update(et_out)
 
-
-
-
-    # --- C chain ---
+    # --- 5. C chain (保留！用於 snap.py 的 nudge 功能) ---
     C_nodes, C_edges = build_C_chain_from_rings(
         rings_m, proj,
         c_step_km=cfg.cchain.c_step_km,
         round_decimals=cfg.cchain.round_decimals,
     )
 
-    # --- Feature nodes ---
-    F_nodes = extract_F_nodes_from_union_smooth(
-        union_smooth_m, proj,
-        sample_step_km=cfg.features.f_sample_step_km,
-        angle_deg_min=cfg.features.f_angle_deg_min,
-        nms_radius_km=cfg.features.f_nms_radius_km,
-        max_keep=cfg.features.f_max_keep,
-    )
-
-    # Attach F -> nearest C (for Gate-F primary selection)
-    F_att = attach_F_to_nearest_C(F_nodes, C_nodes)
-
-    # --- Gates A/F ---
-    Gate_A = build_gate_A_from_C_and_F_v1(
-        C_nodes, rings_df, F_nodes,
-        min_ring_length_km=cfg.gate_a.min_ring_length_km,
-        short_ring_no_gate_km=cfg.gate_a.short_ring_no_gate_km,
-        short_ring_one_gate_km=cfg.gate_a.short_ring_one_gate_km,
-        snap_to_f_km=cfg.gate_a.snap_to_f_km,
-    )
-
-    Gate_F = build_gate_F_primary(
-        F_att, rings_df,
-        min_spacing_km=cfg.gate_f.min_spacing_km,
-        max_per_ring=cfg.gate_f.max_per_ring,
-        global_max=cfg.gate_f.global_max,
-        round_decimals=cfg.cchain.round_decimals,
-    )
-
-    Gate_all = merge_gates(Gate_A, Gate_F, round_decimals=cfg.cchain.round_decimals)
-
-    # 僅用 AOI bbox 內的 gates 做 coverage/connectability（避免算到外面）
-    Gate_all_aoi = _filter_df_in_bbox(Gate_all, bbox_ll)
-
-    # --- Coverage (Gate-A + Gate-F) ---
-    # 1) 補 s_km（靠近哪個 C 就用它的 s_km）
-    Gate_all_att = attach_gates_to_nearest_C(
-        Gate_all_aoi, C_nodes, rings_df,
-        debug=getattr(cfg.coverage, "debug", True),
-    )
-
-    # 2) spacing 抽樣（閉合 ring）
-    Gate_all_cov = coverage_sample_gates_on_rings(
-        Gate_all_att,
-        gate_spacing_km=float(cfg.coverage.gate_spacing_km),
-        min_per_ring=int(cfg.coverage.min_per_ring),
-        prefer_source_order=list(cfg.coverage.prefer_source_order),
-        debug=getattr(cfg.coverage, "debug", True),
-    )
-
-    # 給 Gate-B 用的 gate_uid（確保 connectors 可以回指 gate）
-    Gate_all_cov = Gate_all_cov.copy()
-    Gate_all_cov["gate_uid"] = np.arange(len(Gate_all_cov), dtype=int)
-
-    # --- Sea subnet (scgraph) ---
-    #bbox_ll_sea = _pad_bbox_ll(bbox_ll, pad_deg=float(cfg.sea.aoi_pad_deg))
-    #bundle = scgraph_bridge.sc_edges_in_bbox(bbox_ll=bbox_ll_sea)  # 你現在的 adapter 會回 nodes/edges/stats
-    #S_nodes, S_edges, G, kdt = build_sea_nodes_from_bundle(proj, bundle)
+    # --- 6. Sea Subnet (深海航網) ---
     bbox_ll_sea = _pad_bbox_ll(bbox_ll, pad_deg=float(cfg.sea.aoi_pad_deg))
-
-    # --- dateline-safe: split bbox if needed, fetch multiple bundles, then merge ---
     sea_bboxes = _split_bbox_dateline(bbox_ll_sea)
     bundles = [scgraph_bridge.sc_edges_in_bbox(bbox_ll=b) for b in sea_bboxes]
     bundle = _merge_sc_bundles(bundles)
-
     S_nodes, S_edges, G, kdt = build_sea_nodes_from_bundle(proj, bundle)
-
 
     sea_ok_set = filter_sea_nodes(
         S_nodes, G,
@@ -1541,10 +1856,8 @@ def build_aoi(cfg: RoutingMapConfig) -> Dict[str, Any]:
         use_largest_component_only=bool(cfg.sea.use_largest_component_only),
     )
 
-    # --- Gate-B connectors (Gate -> Sea) ---
+    # --- 7. T-gate -> Sea Connectors (新的橋接機制) ---
     collision_prep = prep(layers["COLLISION_M"])
-    # --- T-gate -> Sea connectors (T-ring gate candidates -> Sea nodes) ---
-    # (keep sea_idx as original S_nodes row-index, so viz can do S_nodes.iloc[sea_idx])
     tgate_sea_connectors = None
     try:
         _tmp_out = {
@@ -1557,126 +1870,49 @@ def build_aoi(cfg: RoutingMapConfig) -> Dict[str, Any]:
         tgate_sea_connectors = build_tgate_sea_connectors(
             _tmp_out,
             params=TGateSeaConnectorParams(
-                k_connect=2,
-                topN=60,
-                r_connect_km=200.0,
-                enable_sector_filter=False,
-                sector_deg=110.0,
-                do_collision_check=True,
-                do_repair=True,
+                k_connect=2, topN=60, r_connect_km=200.0,
+                do_collision_check=True, do_repair=True,
             ),
         )
-        # optional: only keep connectors to "ok" sea nodes (largest component / deg_min filtered)
         if tgate_sea_connectors is not None and len(tgate_sea_connectors) > 0 and sea_ok_set is not None:
-            ok = set(sea_ok_set)
-            tgate_sea_connectors = (
-                tgate_sea_connectors[tgate_sea_connectors["sea_idx"].astype(int).isin(ok)]
-                .reset_index(drop=True)
-            )
+            tgate_sea_connectors = tgate_sea_connectors[tgate_sea_connectors["sea_idx"].astype(int).isin(sea_ok_set)].reset_index(drop=True)
     except Exception:
         tgate_sea_connectors = None
 
-    gateB_connectors = build_gateB_connectors(
-        Gate_all_cov, S_nodes,
-        sea_ok_set=sea_ok_set,
-        kdt=kdt,
-        collision_prep=collision_prep,
-        top_n=cfg.sea.candidate_top_n,
-        r_max_km=cfg.sea.r_max_km,
-        k_connect=cfg.sea.k_connect,
-    )
-
-    # Gate-B kept gates（能連上才算 Gate-B）
-    Gate_B_kept_gates = Gate_all_cov.iloc[0:0].copy()
-    if gateB_connectors is not None and len(gateB_connectors) > 0:
-        if "gate_uid" in gateB_connectors.columns:
-            keep_uid = set(gateB_connectors["gate_uid"].astype(int).tolist())
-            Gate_B_kept_gates = Gate_all_cov[Gate_all_cov["gate_uid"].isin(keep_uid)].reset_index(drop=True)
-        elif "gate_row" in gateB_connectors.columns:
-            keep_row = sorted(set(gateB_connectors["gate_row"].astype(int).tolist()))
-            Gate_B_kept_gates = Gate_all_cov.iloc[keep_row].reset_index(drop=True)
-
-
-    # -------------------------
-    # node_id mappings (for pipeline / heuristic / viz)
-    # -------------------------
-    id2ll: Dict[str, Tuple[float, float]] = {}
-    id2xy: Dict[str, Tuple[float, float]] = {}
-
-    # Sea nodes (S:lon,lat)
-    if isinstance(S_nodes, pd.DataFrame) and len(S_nodes) and "node_id" in S_nodes.columns:
+    # --- 8. ID Mappings (用於路徑搜尋) ---
+    id2ll, id2xy = {}, {}
+    if isinstance(S_nodes, pd.DataFrame) and len(S_nodes):
         for r in S_nodes.itertuples(index=False):
             nid = str(getattr(r, "node_id"))
             id2ll[nid] = (float(getattr(r, "lon")), float(getattr(r, "lat")))
-            if hasattr(r, "x_m") and hasattr(r, "y_m"):
-                id2xy[nid] = (float(getattr(r, "x_m")), float(getattr(r, "y_m")))
+            id2xy[nid] = (float(getattr(r, "x_m")), float(getattr(r, "y_m")))
 
-    # Ring nodes (E:/T:)
     if isinstance(ring_graph, dict):
         for _k, _prefix in [("E_nodes", "E"), ("T_nodes", "T")]:
             df = ring_graph.get(_k)
             if isinstance(df, pd.DataFrame) and len(df):
-                if "node_key" not in df.columns and "node_id" in df.columns:
-                    df = df.copy()
-                    df["node_key"] = df["node_id"].map(lambda i: f"{_prefix}:{int(i)}")
                 for r in df.itertuples(index=False):
                     nid = str(getattr(r, "node_key"))
                     id2ll[nid] = (float(getattr(r, "lon")), float(getattr(r, "lat")))
-                    if hasattr(r, "x_m") and hasattr(r, "y_m"):
-                        id2xy[nid] = (float(getattr(r, "x_m")), float(getattr(r, "y_m")))
-
+                    id2xy[nid] = (float(getattr(r, "x_m")), float(getattr(r, "y_m")))
 
     return {
         "cfg": cfg,
         "bbox_ll": bbox_ll,
-        "id2ll": id2ll,
-        "id2xy": id2xy,
-        "bbox_ll_sea": bbox_ll_sea,
-        "bbox_ll_sea_parts": sea_bboxes,
+        "id2ll": id2ll, "id2xy": id2xy,
         "proj": proj,
         "collision_prep": collision_prep,
-
-        "polys_ll": polys_ll,
         "layers": layers,
-        "union_smooth_m": union_smooth_m,
-
-        "ring_base_m": ring_base_m,
-        "rings_m": rings_m,
-        "rings_df": rings_df,
-        "rings_env_m": rings_env_m,
-        "rings_taut_m": rings_taut_m,
-        "rings_obj": rings_obj,
         "ring_graph": ring_graph,
-
-        "C_nodes": C_nodes,
+        "C_nodes": C_nodes, # 重要：給 Nudge 用
         "C_edges": C_edges,
-
-        "F_nodes": F_nodes,
-        "F_att": F_att,
-
-        "Gate_A": Gate_A,
-        "Gate_F": Gate_F,
-        "Gate_all": Gate_all,
-
-        # Coverage outputs
-        "Gate_all_aoi": Gate_all_aoi,
-        "Gate_all_cov": Gate_all_cov,
-
-        # Sea outputs
-        "sc_bundle_stats": bundle.get("stats", {}) if isinstance(bundle, dict) else {},
         "S_nodes": S_nodes,
         "S_edges": S_edges,
         "sea_graph": G,
         "sea_kdt": kdt,
         "sea_ok_set": sea_ok_set,
         "tgate_sea_connectors": tgate_sea_connectors,
-
-
-        # Gate-B outputs
-        "gateB_connectors": gateB_connectors,
-        "Gate_B_kept_gates": Gate_B_kept_gates,
     }
-
 
 ==================================================
 FILE_PATH: routing_map\cache_utils.py
@@ -2396,26 +2632,6 @@ class CChainConfig:
     island_area_min_km2: float = 20.0
 
 @dataclass
-class FeatureConfig:
-    f_sample_step_km: float = 15.0
-    f_angle_deg_min: float = 35.0
-    f_nms_radius_km: float = 25.0
-    f_max_keep: int = 2500
-
-@dataclass
-class GateAConfig:
-    min_ring_length_km: float = 500.0
-    short_ring_no_gate_km: float = 150.0
-    short_ring_one_gate_km: float = 400.0
-    snap_to_f_km: float = 15.0
-
-@dataclass
-class GateFConfig:
-    min_spacing_km: float = 250.0
-    max_per_ring: int = 3
-    global_max: int = 3000
-
-@dataclass
 class SeaConfig:
     # Gate-B v1 parameters
     r_max_km: float = 300.0
@@ -2426,161 +2642,14 @@ class SeaConfig:
     use_largest_component_only: bool = True
 
 @dataclass
-class CoverageConfig:
-    # 沿岸 gate spacing（km）：越小 gate 越密；Phase1 建議先 80~150 試
-    gate_spacing_km: float = 120.0
-
-    # 每條 ring 抽樣後至少保留幾個 gate（你指定 1）
-    min_per_ring: int = 1
-
-    # 同一位置/很近時的優先順序（你選 Gate_A + Gate_F 都套，且 Gate_F 優先）
-    prefer_source_order: List[str] = field(default_factory=lambda: ["Gate_F", "Gate_A"])
-
-    # debug log
-    debug: bool = True
-
-@dataclass
 class RoutingMapConfig:
     aoi: AoiConfig
     land: LandConfig
     smooth: SmoothConfig = SmoothConfig()
-    cchain: CChainConfig = CChainConfig()
-    features: FeatureConfig = FeatureConfig()
-    gate_a: GateAConfig = GateAConfig()
-    gate_f: GateFConfig = GateFConfig()
+    cchain: CChainConfig = CChainConfig()  # 保留，因為 C-node 還在用
     sea: SeaConfig = SeaConfig()
-    coverage: CoverageConfig = CoverageConfig()
     rings: Optional[RingBuildConfig] = None
 
-
-
-
-==================================================
-FILE_PATH: routing_map\c_gateb_connectors.py
-==================================================
-
-# c_gateb_connectors.py
-from __future__ import annotations
-
-import numpy as np
-import pandas as pd
-
-
-def in_bbox(lon: float, lat: float, bbox_ll) -> bool:
-    """
-    bbox_ll = (min_lon, min_lat, max_lon, max_lat)
-    """
-    if bbox_ll is None:
-        return True
-    min_lon, min_lat, max_lon, max_lat = map(float, bbox_ll)
-    return (min_lon <= float(lon) <= max_lon) and (min_lat <= float(lat) <= max_lat)
-
-
-def build_cnode_gateb_connectors_nearest(
-    C_nodes: pd.DataFrame,
-    gateB_df: pd.DataFrame,
-    *,
-    bbox_ll=None,
-    max_deg_dist=None,
-) -> pd.DataFrame:
-    """
-    建立 C node ↔ GateB 的橋接邊：每個 GateB 接到 AOI 內「最近的」C node。
-
-    Parameters
-    ----------
-    C_nodes : DataFrame
-        必須含欄位: c_id, lon, lat
-    gateB_df : DataFrame
-        必須含欄位: g_id, lon, lat
-    bbox_ll : tuple(min_lon, min_lat, max_lon, max_lat) | None
-        只使用 AOI 內的 C node / GateB 建 connector
-    max_deg_dist : float | None
-        若設定，距離（經緯度的歐氏距離，單位=度）> max_deg_dist 的 connector 會被丟棄。
-        （用來避免把 GateB 接到非常遠的海岸點；debug 建議先 None）
-
-    Returns
-    -------
-    DataFrame with columns:
-        g_id, g_lon, g_lat, c_id, c_lon, c_lat, dist_deg
-    """
-    if C_nodes is None or gateB_df is None or len(C_nodes) == 0 or len(gateB_df) == 0:
-        return pd.DataFrame(columns=["g_id", "g_lon", "g_lat", "c_id", "c_lon", "c_lat", "dist_deg"])
-
-    need_c = {"c_id", "lon", "lat"}
-    need_g = {"g_id", "lon", "lat"}
-    if not need_c.issubset(set(C_nodes.columns)):
-        raise ValueError(f"C_nodes must contain columns {need_c}, got {list(C_nodes.columns)}")
-    if not need_g.issubset(set(gateB_df.columns)):
-        raise ValueError(f"gateB_df must contain columns {need_g}, got {list(gateB_df.columns)}")
-
-    # AOI filter
-    C = C_nodes[["c_id", "lon", "lat"]].copy()
-    C = C[C.apply(lambda r: in_bbox(r["lon"], r["lat"], bbox_ll), axis=1)]
-    if len(C) == 0:
-        return pd.DataFrame(columns=["g_id", "g_lon", "g_lat", "c_id", "c_lon", "c_lat", "dist_deg"])
-
-    G = gateB_df[["g_id", "lon", "lat"]].copy()
-    G = G[G.apply(lambda r: in_bbox(r["lon"], r["lat"], bbox_ll), axis=1)]
-    if len(G) == 0:
-        return pd.DataFrame(columns=["g_id", "g_lon", "g_lat", "c_id", "c_lon", "c_lat", "dist_deg"])
-
-    c_arr = C[["lon", "lat"]].to_numpy(dtype=float)
-    c_ids = C["c_id"].to_numpy()
-
-    rows = []
-    for _, gr in G.iterrows():
-        g_id = int(gr["g_id"])
-        g_lon = float(gr["lon"])
-        g_lat = float(gr["lat"])
-
-        d2 = (c_arr[:, 0] - g_lon) ** 2 + (c_arr[:, 1] - g_lat) ** 2
-        j = int(np.argmin(d2))
-        dist = float(np.sqrt(d2[j]))
-
-        if max_deg_dist is not None and dist > float(max_deg_dist):
-            continue
-
-        rows.append(
-            {
-                "g_id": g_id,
-                "g_lon": g_lon,
-                "g_lat": g_lat,
-                "c_id": int(c_ids[j]),
-                "c_lon": float(c_arr[j, 0]),
-                "c_lat": float(c_arr[j, 1]),
-                "dist_deg": dist,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-def add_cnode_gateb_connectors_to_graph(
-    G,
-    connectors_df: pd.DataFrame,
-    *,
-    etype="c_gb",
-    weight_col="dist_deg",
-):
-    """
-    把 connectors_df 加入 networkx Graph。
-    節點使用 (lon,lat) tuple，避免 numpy array unhashable 問題。
-    """
-    if connectors_df is None or len(connectors_df) == 0:
-        return 0
-
-    need = {"g_lon", "g_lat", "c_lon", "c_lat", weight_col}
-    if not need.issubset(set(connectors_df.columns)):
-        raise ValueError(f"connectors_df must contain {need}, got {list(connectors_df.columns)}")
-
-    added = 0
-    for _, r in connectors_df.iterrows():
-        gb = (float(r["g_lon"]), float(r["g_lat"]))
-        c = (float(r["c_lon"]), float(r["c_lat"]))
-        w = float(r[weight_col])
-        G.add_edge(c, gb, weight=w, etype=etype)
-        added += 1
-    return added
 
 
 ==================================================
@@ -3060,682 +3129,6 @@ def build_e_t_transfer_edges(
     }
 
 ==================================================
-FILE_PATH: routing_map\features.py
-==================================================
-
-from __future__ import annotations
-import math
-from typing import List, Tuple
-
-import numpy as np
-import pandas as pd
-from shapely.geometry import Polygon, MultiPolygon, LineString, GeometryCollection
-from shapely.ops import transform
-
-from .geom_utils import AOIProjector
-
-def _iter_polygons_any(geom):
-    if geom is None or geom.is_empty:
-        return []
-    if isinstance(geom, Polygon):
-        return [geom]
-    if isinstance(geom, MultiPolygon):
-        return list(geom.geoms)
-    if isinstance(geom, GeometryCollection):
-        polys = []
-        for g in geom.geoms:
-            polys.extend(_iter_polygons_any(g))
-        return polys
-    return []
-
-def _sample_line_xy(line: LineString, step_m: float) -> np.ndarray:
-    if line.is_empty or line.length <= 0:
-        return np.zeros((0,2), dtype=float)
-    n = max(2, int(math.ceil(line.length / step_m)) + 1)
-    pts = [line.interpolate(i*step_m) for i in range(n)]
-    return np.array([[float(p.x), float(p.y)] for p in pts], dtype=float)
-
-def _turn_angles_deg(xy: np.ndarray) -> np.ndarray:
-    # angle at each interior point using segments (p[i]-p[i-1]) and (p[i+1]-p[i])
-    n = len(xy)
-    ang = np.zeros(n, dtype=float)
-    if n < 3:
-        return ang
-    for i in range(1, n-1):
-        a = xy[i] - xy[i-1]
-        b = xy[i+1] - xy[i]
-        na = np.linalg.norm(a)
-        nb = np.linalg.norm(b)
-        if na < 1e-9 or nb < 1e-9:
-            ang[i] = 0.0
-            continue
-        cosv = float(np.clip(np.dot(a, b)/(na*nb), -1.0, 1.0))
-        ang[i] = math.degrees(math.acos(cosv))
-    return ang
-
-def _nms_points_xy(xy: np.ndarray, score: np.ndarray, radius_km: float, max_keep: int):
-    if len(xy) == 0:
-        return []
-    rad2 = (radius_km*1000.0)**2
-    order = np.argsort(-score)
-    keep = []
-    suppressed = np.zeros(len(xy), dtype=bool)
-    for j in order:
-        if suppressed[j]:
-            continue
-        keep.append(int(j))
-        if len(keep) >= max_keep:
-            break
-        d2 = ((xy - xy[j])**2).sum(axis=1)
-        suppressed |= (d2 <= rad2)
-        suppressed[j] = False
-    return keep
-
-def extract_F_nodes_from_union_smooth(
-    union_smooth_m,
-    proj: AOIProjector,
-    *,
-    sample_step_km: float,
-    angle_deg_min: float,
-    nms_radius_km: float,
-    max_keep: int,
-) -> pd.DataFrame:
-    """Extract 'feature nodes' (F) from smoothed land union boundary.
-
-    Heuristic:
-      - sample exterior rings every sample_step_km
-      - compute turning angles; keep those above angle_deg_min
-      - apply NMS to enforce spatial spread
-
-    Returns DataFrame with lon/lat and metric coords and a 'score' column.
-    """
-    step_m = sample_step_km * 1000.0
-    polys = _iter_polygons_any(union_smooth_m)
-    cand_xy = []
-    cand_score = []
-    cand_meta = []
-
-    for poly in polys:
-        ext = poly.exterior
-        xy = _sample_line_xy(ext, step_m)
-        if len(xy) == 0:
-            continue
-        ang = _turn_angles_deg(xy)
-        # score = angle (bigger is sharper)
-        mask = ang >= angle_deg_min
-        idxs = np.where(mask)[0]
-        for i in idxs:
-            cand_xy.append(xy[i])
-            cand_score.append(float(ang[i]))
-    if not cand_xy:
-        return pd.DataFrame(columns=["f_id","lon","lat","x_m","y_m","score"])
-
-    cand_xy = np.asarray(cand_xy, dtype=float)
-    cand_score = np.asarray(cand_score, dtype=float)
-    keep = _nms_points_xy(cand_xy, cand_score, radius_km=nms_radius_km, max_keep=max_keep)
-
-    rows = []
-    for k, j in enumerate(keep):
-        x, y = float(cand_xy[j,0]), float(cand_xy[j,1])
-        lon, lat = proj.to_ll.transform(x, y)
-        rows.append({
-            "f_id": int(k),
-            "lon": float(lon), "lat": float(lat),
-            "x_m": x, "y_m": y,
-            "score": float(cand_score[j]),
-        })
-    return pd.DataFrame(rows)
-
-
-==================================================
-FILE_PATH: routing_map\gates_a.py
-==================================================
-
-from __future__ import annotations
-import numpy as np
-import pandas as pd
-
-def build_gate_A_from_C_and_F_v1(
-    C_nodes: pd.DataFrame,
-    rings_df: pd.DataFrame,
-    F_nodes: pd.DataFrame,
-    *,
-    min_ring_length_km: float,
-    short_ring_no_gate_km: float,
-    short_ring_one_gate_km: float,
-    snap_to_f_km: float,
-) -> pd.DataFrame:
-    """Build Gate-A from C coverage; optionally snap to nearest F point.
-
-    This is a straight refactor of the notebook's slim v1 strategy:
-      - Decide number of gates per ring based on ring length
-      - Place gates by arclength quantiles on C nodes
-      - Snap gate location to nearest F if within snap_to_f_km
-    """
-    # Build quick access arrays for snapping
-    Fx = F_nodes["x_m"].to_numpy(dtype=float) if len(F_nodes) else np.array([])
-    Fy = F_nodes["y_m"].to_numpy(dtype=float) if len(F_nodes) else np.array([])
-    Fr2 = (snap_to_f_km * 1000.0) ** 2
-
-    def nearest_F(x, y):
-        if len(Fx) == 0:
-            return None
-        dx = Fx - x
-        dy = Fy - y
-        d2 = dx*dx + dy*dy
-        j = int(np.argmin(d2))
-        if float(d2[j]) <= Fr2:
-            return j
-        return None
-
-    rows = []
-    g_id = 0
-    # ring lengths
-    ring_len = rings_df.set_index("ring_id")["length_km"].to_dict() if not rings_df.empty else {}
-    for ring_id, g in C_nodes.groupby("ring_id"):
-        L = float(ring_len.get(ring_id, g["s_km"].max() if len(g) else 0.0))
-        if L < short_ring_no_gate_km:
-            continue
-        if L < short_ring_one_gate_km:
-            n_gate = 1
-        elif L < min_ring_length_km:
-            n_gate = 2
-        else:
-            n_gate = max(2, int(round(L / min_ring_length_km)))
-
-        gg = g.sort_values("s_km")
-        s = gg["s_km"].to_numpy(dtype=float)
-        for k in range(n_gate):
-            q = (k + 0.5) / n_gate
-            target = q * s[-1]
-            j = int(np.argmin(np.abs(s - target)))
-            row = gg.iloc[j].to_dict()
-            x, y = float(row["x_m"]), float(row["y_m"])
-            snap_j = nearest_F(x, y)
-            if snap_j is not None:
-                # snap to F
-                fx, fy = float(F_nodes.iloc[snap_j]["x_m"]), float(F_nodes.iloc[snap_j]["y_m"])
-                row["x_m"], row["y_m"] = fx, fy
-                row["lon"], row["lat"] = float(F_nodes.iloc[snap_j]["lon"]), float(F_nodes.iloc[snap_j]["lat"])
-                source = "A_COVERAGE_SNAP_F"
-            else:
-                source = "A_COVERAGE"
-
-            rows.append({
-                "g_id": int(g_id),
-                "ring_id": int(ring_id),
-                "lon": float(row["lon"]),
-                "lat": float(row["lat"]),
-                "x_m": float(row["x_m"]),
-                "y_m": float(row["y_m"]),
-                "source": source,
-            })
-            g_id += 1
-
-    return pd.DataFrame(rows)
-
-
-==================================================
-FILE_PATH: routing_map\gates_b.py
-==================================================
-
-from __future__ import annotations
-
-import numpy as np
-import pandas as pd
-from shapely.prepared import PreparedGeometry
-from sklearn.neighbors import KDTree
-
-from .visibility import segment_clear
-
-
-def gate_to_sea_candidates(
-    gate_xy: np.ndarray,
-    *,
-    S_nodes: pd.DataFrame,
-    kdt: KDTree,
-    top_n: int,
-    r_max_km: float,
-) -> list[int]:
-    """Return candidate sea node indices near gate (within r_max_km)."""
-    n = 0 if S_nodes is None else len(S_nodes)
-    if n <= 0:
-        return []
-
-    k = min(int(top_n), n)          # ✅ 关键：k 不能超过训练点数
-    if k <= 0:
-        return []
-    r = float(r_max_km) * 1000.0
-    dist, idx = kdt.query([gate_xy], k=k, return_distance=True)
-    dist = dist[0]
-    idx = idx[0]
-    keep = [int(i) for d, i in zip(dist, idx) if float(d) <= r]
-    return keep
-
-
-def build_gateB_connectors(
-    Gate_all: pd.DataFrame,
-    S_nodes: pd.DataFrame,
-    *,
-    sea_ok_set: set[int],
-    kdt: KDTree,
-    collision_prep: PreparedGeometry,
-    top_n: int,
-    r_max_km: float,
-    k_connect: int,
-) -> pd.DataFrame:
-    """
-    For each gate, pick up to k_connect sea nodes with collision-free segments.
-
-    Output columns (stable):
-      - gate_uid: int   (PRIMARY KEY for the gate row in Gate_all)
-      - gate_row: int   (row index during iterrows; for debug)
-      - g_id: int|None  (if exists; Gate_F may not have it)
-      - source: str|None (if exists)
-      - sea_idx: int
-      - sea_node_id: str
-      - dist_km: float
-      - rank: int
-    """
-    Gate_all = Gate_all.copy()
-
-    # Ensure gate_uid exists (primary key for back-referencing gates)
-    if "gate_uid" not in Gate_all.columns:
-        Gate_all["gate_uid"] = np.arange(len(Gate_all), dtype=int)
-
-    rows: list[dict] = []
-
-    for gate_row, g in Gate_all.iterrows():
-        # required gate coords
-        gx, gy = float(g["x_m"]), float(g["y_m"])
-        gate_uid = int(g["gate_uid"])
-
-        # optional identifiers
-        g_id = None
-        if "g_id" in Gate_all.columns and pd.notna(g.get("g_id", None)):
-            try:
-                g_id = int(g["g_id"])
-            except Exception:
-                g_id = None
-
-        source = None
-        if "source" in Gate_all.columns and pd.notna(g.get("source", None)):
-            source = str(g["source"])
-
-        # candidate sea nodes near gate
-        cand = gate_to_sea_candidates(
-            np.array([gx, gy], dtype=float),
-            S_nodes=S_nodes, kdt=kdt, top_n=top_n, r_max_km=r_max_km
-        )
-        # filter by component/degree etc.
-        cand = [i for i in cand if int(i) in sea_ok_set]
-
-        scored: list[tuple[float, int]] = []
-        for i in cand:
-            s = S_nodes.iloc[int(i)]
-            sx, sy = float(s["x_m"]), float(s["y_m"])
-
-            # collision-free check
-            if not segment_clear((gx, gy), (sx, sy), collision_prep=collision_prep):
-                continue
-
-            d_km = float(np.hypot(sx - gx, sy - gy) / 1000.0)
-            scored.append((d_km, int(i)))
-
-        # nearest first
-        scored.sort(key=lambda t: t[0])
-
-        for rank, (d_km, i) in enumerate(scored[: int(k_connect)]):
-            s = S_nodes.iloc[int(i)]
-            rows.append({
-                "gate_uid": gate_uid,
-                "gate_row": int(gate_row),
-                "g_id": g_id,
-                "source": source,
-
-                "sea_idx": int(i),
-                "sea_node_id": str(s["node_id"]),
-                "dist_km": float(d_km),
-                "rank": int(rank),
-            })
-
-    return pd.DataFrame(rows)
-
-
-==================================================
-FILE_PATH: routing_map\gates_coverage.py
-==================================================
-
-# routing_map/gates_coverage.py
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
-
-
-def _ensure_cols(df: pd.DataFrame, cols: List[str], name: str):
-    miss = [c for c in cols if c not in df.columns]
-    if miss:
-        raise KeyError(f"{name} missing columns: {miss}")
-
-
-def attach_gates_to_nearest_C(
-    gates: pd.DataFrame,
-    C_nodes: pd.DataFrame,
-    rings_df: Optional[pd.DataFrame] = None,
-    *,
-    ring_id_col: str = "ring_id",
-    gate_x_col: str = "x_m",
-    gate_y_col: str = "y_m",
-    c_x_col: str = "x_m",
-    c_y_col: str = "y_m",
-    c_s_col: str = "s_km",
-    out_s_col: str = "s_km",
-    out_ringlen_col: str = "ring_length_km",
-    debug: bool = True,
-) -> pd.DataFrame:
-    """
-    對所有 gates 補上沿岸序列資訊 s_km（靠近哪個 C node 就用它的 s_km）。
-    這樣 Gate_A / Gate_F 都可以一起做 coverage sampling。
-
-    要求：
-      - gates 需有 ring_id + x_m/y_m
-      - C_nodes 需有 ring_id + x_m/y_m + s_km
-    """
-    if gates is None or len(gates) == 0:
-        return gates.copy()
-
-    _ensure_cols(gates, [ring_id_col, gate_x_col, gate_y_col], "gates")
-    _ensure_cols(C_nodes, [ring_id_col, c_x_col, c_y_col, c_s_col], "C_nodes")
-
-    out = gates.copy()
-
-    # ring length（km）優先用 rings_df.length_km
-    ringlen_map: Dict[int, float] = {}
-    if rings_df is not None and len(rings_df) > 0 and ("ring_id" in rings_df.columns) and ("length_km" in rings_df.columns):
-        try:
-            ringlen_map = dict(zip(rings_df["ring_id"].astype(int), rings_df["length_km"].astype(float)))
-        except Exception:
-            ringlen_map = {}
-
-    # 建 ring->C 索引，逐 ring 做最近鄰（gate 數通常很少，所以用 numpy brute-force 夠穩）
-    out_s = np.full(len(out), np.nan, dtype=float)
-    out_ringlen = np.full(len(out), np.nan, dtype=float)
-
-    # group C by ring
-    C_groups = {rid: g for rid, g in C_nodes.groupby(ring_id_col)}
-
-    # gates by ring
-    for rid, g_gate in out.groupby(ring_id_col):
-        try:
-            rid_i = int(rid)
-        except Exception:
-            continue
-
-        if rid_i not in C_groups:
-            continue
-
-        gC = C_groups[rid_i]
-        C_xy = gC[[c_x_col, c_y_col]].to_numpy(dtype=float)
-        C_s = gC[c_s_col].to_numpy(dtype=float)
-
-        gate_idx = g_gate.index.to_numpy()
-        G_xy = g_gate[[gate_x_col, gate_y_col]].to_numpy(dtype=float)
-
-        # brute-force nearest: O(n_gate * n_C) ; n_gate(每 ring) 通常很小
-        # dist2 = (G[:,None,:] - C[None,:,:])^2 sum
-        diff = G_xy[:, None, :] - C_xy[None, :, :]
-        dist2 = np.einsum("ijk,ijk->ij", diff, diff)
-        nn = np.argmin(dist2, axis=1)
-        out_s[gate_idx] = C_s[nn]
-
-        # ring length km
-        if ringlen_map:
-            out_ringlen[gate_idx] = ringlen_map.get(rid_i, np.nan)
-
-    out[out_s_col] = out_s
-    out[out_ringlen_col] = out_ringlen
-
-    if debug:
-        n_tot = len(out)
-        n_ok = int(np.isfinite(out[out_s_col]).sum())
-        print(f"[coverage] attach gates->C: s_km assigned {n_ok}/{n_tot}")
-
-    return out
-
-
-def _pick_best_one(df: pd.DataFrame, prefer_source_order: List[str]) -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return df
-
-    src = df["source"].astype(str) if "source" in df.columns else pd.Series([""] * len(df), index=df.index)
-    pri_map = {s: i for i, s in enumerate(prefer_source_order)}
-    pri = src.map(lambda x: pri_map.get(x, 9999))
-
-    # 若有 score 用 score；不然就用原排序
-    if "score" in df.columns:
-        score = pd.to_numeric(df["score"], errors="coerce").fillna(-1e18)
-        best_idx = (pd.DataFrame({"pri": pri, "score": -score}, index=df.index)
-                    .sort_values(["pri", "score"])
-                    .index[0])
-    else:
-        best_idx = (pd.DataFrame({"pri": pri}, index=df.index)
-                    .sort_values(["pri"])
-                    .index[0])
-    return df.loc[[best_idx]]
-
-
-def coverage_sample_gates_on_rings(
-    gates: pd.DataFrame,
-    *,
-    gate_spacing_km: float,
-    min_per_ring: int,
-    prefer_source_order: List[str],
-    ring_id_col: str = "ring_id",
-    s_col: str = "s_km",
-    ringlen_col: str = "ring_length_km",
-    debug: bool = True,
-) -> pd.DataFrame:
-    """
-    對 gates 做 coverage sampling（閉合 ring 版本）：
-    - 以 ring 分組
-    - 依 s_km 排序
-    - 找最大 gap 作起點，做 greedy spacing 抽樣
-    - 每 ring 至少保留 min_per_ring 個（你指定 1）
-
-    注意：這裡假設 gates 已經有 s_km（用 attach_gates_to_nearest_C 補的）。
-    """
-    if gates is None or len(gates) == 0:
-        return gates.copy()
-
-    _ensure_cols(gates, [ring_id_col], "gates")
-    if s_col not in gates.columns:
-        raise KeyError(f"gates missing {s_col}. Run attach_gates_to_nearest_C() first.")
-
-    out_rows = []
-
-    before = len(gates)
-    spacing = float(gate_spacing_km)
-
-    for rid, g in gates.groupby(ring_id_col):
-        gg = g.copy()
-
-        # 沒 s_km（或 NaN）就先全留（不冒險砍掉）
-        s = pd.to_numeric(gg[s_col], errors="coerce")
-        ok = np.isfinite(s.to_numpy())
-        if ok.sum() == 0:
-            out_rows.append(gg)
-            continue
-        gg = gg.loc[ok].copy()
-        s = s.loc[ok].to_numpy(dtype=float)
-
-        # ring length
-        ring_len = None
-        if ringlen_col in gg.columns:
-            v = pd.to_numeric(gg[ringlen_col], errors="coerce").dropna()
-            if len(v) > 0:
-                ring_len = float(v.iloc[0])
-        if (ring_len is None) or (not np.isfinite(ring_len)) or (ring_len <= 0):
-            # fallback：用 s_km range 近似（較差但比沒有好）
-            ring_len = float(s.max() - s.min())
-            if ring_len <= 0:
-                # 全部在同一點
-                out_rows.append(_pick_best_one(gg, prefer_source_order))
-                continue
-
-        # sort by s
-        order = np.argsort(s)
-        gg = gg.iloc[order].copy()
-        s = s[order]
-
-        n = len(gg)
-        if n == 1:
-            out_rows.append(gg)
-            continue
-
-        # gaps + wrap gap
-        gaps = np.diff(s)
-        wrap_gap = ring_len - (s[-1] - s[0])
-        gaps_full = np.concatenate([gaps, [wrap_gap]])
-        start = int(np.argmax(gaps_full))  # gap index
-        start_idx = (start + 1) % n        # first pick index
-
-        # greedy on doubled axis
-        s0 = float(s[start_idx])
-        s_d = np.concatenate([s, s + ring_len])  # length 2n
-        idx_d = np.concatenate([np.arange(n), np.arange(n)])
-
-        picked = []
-        last = s0
-        picked.append(start_idx)
-
-        # iterate forward from start_idx+1 to start_idx+n-1 (in doubled index space)
-        # find indices in doubled ordering: map local indices by shifting
-        # easiest: traverse k = start_idx+1 ... start_idx+n-1 in circular
-        for step in range(1, n):
-            j = (start_idx + step) % n
-            # we need "current s" in unwrapped axis:
-            # if j <= start_idx -> add ring_len
-            cur = float(s[j] + (ring_len if j <= start_idx else 0.0))
-            if cur - last >= spacing:
-                picked.append(j)
-                last = cur
-
-        picked_df = gg.iloc[picked].copy()
-
-        # enforce min_per_ring
-        if len(picked_df) < int(min_per_ring):
-            # 只補到 1（你目前 min_per_ring=1）
-            picked_df = _pick_best_one(gg, prefer_source_order)
-
-        out_rows.append(picked_df)
-
-    out = pd.concat(out_rows, ignore_index=True) if out_rows else gates.iloc[0:0].copy()
-
-    if debug:
-        after = len(out)
-        print(f"[coverage] spacing sample: before={before} after={after} removed={before-after} "
-              f"(spacing_km={gate_spacing_km}, min_per_ring={min_per_ring})")
-
-    return out
-
-
-==================================================
-FILE_PATH: routing_map\gates_f.py
-==================================================
-
-from __future__ import annotations
-import pandas as pd
-
-def build_gate_F_primary(
-    F_att: pd.DataFrame,
-    rings_df: pd.DataFrame,
-    *,
-    min_spacing_km: float,
-    max_per_ring: int,
-    global_max: int,
-    round_decimals: int,
-) -> pd.DataFrame:
-    """Pick primary gates from F points (greedy by score with spacing on s_km)."""
-    if F_att.empty:
-        return pd.DataFrame(columns=["ring_id","lon","lat","x_m","y_m","source","score","s_km"])
-
-    rows = []
-    g_id = 0
-    for ring_id, g in F_att.groupby("ring_id"):
-        gg = g.sort_values("score", ascending=False).copy()
-        picked_s = []
-        picked = 0
-        for _, r in gg.iterrows():
-            s = float(r.get("s_km", 0.0))
-            if any(abs(s - ps) < min_spacing_km for ps in picked_s):
-                continue
-            picked_s.append(s)
-            rows.append({
-                "ring_id": int(ring_id),
-                "lon": float(r["lon"]),
-                "lat": float(r["lat"]),
-                "x_m": float(r["x_m"]),
-                "y_m": float(r["y_m"]),
-                "source": "F_PRIMARY",
-                "score": float(r.get("score", 0.0)),
-                "s_km": float(r.get("s_km", 0.0)),
-            })
-            g_id += 1
-            picked += 1
-            if picked >= max_per_ring or g_id >= global_max:
-                break
-        if g_id >= global_max:
-            break
-
-    Gate_F = pd.DataFrame(rows)
-    # rounding/dedup friendliness
-    if not Gate_F.empty:
-        Gate_F["lon"] = Gate_F["lon"].round(round_decimals)
-        Gate_F["lat"] = Gate_F["lat"].round(round_decimals)
-    return Gate_F
-
-
-==================================================
-FILE_PATH: routing_map\gates_merge.py
-==================================================
-
-from __future__ import annotations
-import numpy as np
-import pandas as pd
-
-def merge_gates(Gate_A: pd.DataFrame, Gate_F: pd.DataFrame, *, round_decimals: int = 5) -> pd.DataFrame:
-    cols = ["ring_id","lon","lat","x_m","y_m","source"]
-    A = Gate_A.copy() if Gate_A is not None else pd.DataFrame(columns=cols)
-    F = Gate_F.copy() if Gate_F is not None else pd.DataFrame(columns=cols)
-
-    if "source" not in A.columns:
-        A["source"] = "A_COVERAGE"
-    if "source" not in F.columns:
-        F["source"] = "F_PRIMARY"
-
-    for df in (A, F):
-        for c in cols:
-            if c not in df.columns:
-                df[c] = np.nan
-        df["lon"] = df["lon"].astype(float)
-        df["lat"] = df["lat"].astype(float)
-        df["lon_r"] = df["lon"].round(round_decimals)
-        df["lat_r"] = df["lat"].round(round_decimals)
-
-    allg = pd.concat([F[cols+["lon_r","lat_r"]], A[cols+["lon_r","lat_r"]]], ignore_index=True)
-    # prefer F_PRIMARY when duplicate coords
-    pref = allg["source"].astype(str).apply(lambda s: 0 if s == "F_PRIMARY" else 1)
-    allg = allg.assign(_pref=pref).sort_values(["ring_id","lon_r","lat_r","_pref"])
-    allg = allg.drop_duplicates(subset=["ring_id","lon_r","lat_r"], keep="first").drop(columns=["lon_r","lat_r","_pref"]).reset_index(drop=True)
-    allg["g_id"] = np.arange(len(allg), dtype=int)
-    return allg
-
-
-==================================================
 FILE_PATH: routing_map\geom_utils.py
 ==================================================
 
@@ -4095,49 +3488,6 @@ def clip_collision_to_aoi_bbox(
     except Exception:
         # conservative fallback: return raw
         return collision_raw
-
-
-==================================================
-FILE_PATH: routing_map\inject.py
-==================================================
-
-from __future__ import annotations
-import numpy as np
-import pandas as pd
-
-def attach_F_to_nearest_C(F_nodes: pd.DataFrame, C_nodes: pd.DataFrame) -> pd.DataFrame:
-    """Attach each F to nearest C node (adds ring_id, s_km, nearest_c_id, dist_to_c_km).
-
-    Notebook used brute force; we keep a vectorized-ish version.
-    Complexity is fine for O(1e3) F nodes.
-    """
-    if len(F_nodes) == 0 or len(C_nodes) == 0:
-        out = F_nodes.copy()
-        out["ring_id"] = -1
-        out["s_km"] = np.nan
-        out["nearest_c_id"] = -1
-        out["dist_to_c_km"] = np.nan
-        return out
-
-    Cxy = C_nodes[["x_m","y_m"]].to_numpy(dtype=float)
-    Cring = C_nodes["ring_id"].to_numpy(dtype=int)
-    Cs = C_nodes["s_km"].to_numpy(dtype=float)
-    Cid = C_nodes["c_id"].to_numpy(dtype=int) if "c_id" in C_nodes.columns else C_nodes.index.to_numpy(dtype=int)
-
-    rows = []
-    for _, f in F_nodes.iterrows():
-        fx, fy = float(f["x_m"]), float(f["y_m"])
-        d2 = (Cxy[:,0]-fx)**2 + (Cxy[:,1]-fy)**2
-        j = int(np.argmin(d2))
-        dist_km = float(np.sqrt(d2[j]) / 1000.0)
-        rows.append((int(Cring[j]), float(Cs[j]), int(Cid[j]), dist_km))
-
-    out = F_nodes.copy()
-    out["ring_id"] = [t[0] for t in rows]
-    out["s_km"] = [t[1] for t in rows]
-    out["nearest_c_id"] = [t[2] for t in rows]
-    out["dist_to_c_km"] = [t[3] for t in rows]
-    return out
 
 
 ==================================================
@@ -7783,25 +7133,14 @@ class RingResult:
 FILE_PATH: routing_map\routing_graph.py
 ==================================================
 
+# routing_map/routing_graph.py
 from __future__ import annotations
 
-"""routing_map.routing_graph (node_id edition)
+"""
+routing_map.routing_graph (Rings-focused Edition - Fixed)
 
-This version uses **string node_id** keys everywhere in the assembled NetworkX graph.
-
-Node key scheme:
-- Sea nodes:  "S:{lon:.6f},{lat:.6f}"  (lon wrapped to [-180,180))
-- Envelope ring nodes: "E:{int_id}"
-- Taut ring nodes:     "T:{int_id}"
-- Injected query nodes: "Q:START", "Q:END" (in pipeline)
-
-Edges store:
-- weight (km)
-- length_km (km)
-- etype (string)
-- layer_mask (bitmask)
-- ban_mask (bitmask)
-- lat_max_abs (float)
+使用字串 node_id 作為 NetworkX 圖資的 Key。
+修正了 ET_edges 缺少 u_key/v_key 欄位時的報錯問題。
 """
 
 from dataclasses import dataclass
@@ -7811,319 +7150,169 @@ import math
 import networkx as nx
 import pandas as pd
 
-from .geom_utils import coord_id, wrap_lon
-
+from routing_map.geom_utils import coord_id, wrap_lon
 
 LonLat = Tuple[float, float]
+
 # -------------------------
-# Edge layer / ban masks (bitmask)
+# Edge layer / ban masks
 # -------------------------
+L_BASE_SEA      = 1 << 0
+L_RING_E        = 1 << 1
+L_RING_T        = 1 << 2
+L_ET_TRANSFER   = 1 << 3
+L_TGATE_SEA     = 1 << 4
+L_GATEWAY       = 1 << 5
+L_NE_CORRIDOR   = 1 << 6
+L_NW_CORRIDOR   = 1 << 7
+L_INJECT        = 1 << 8
 
-# Layer bits: an edge can belong to multiple layers (OR together).
-L_BASE_SEA      = 1 << 0  # normal sea edges
-L_RING_E        = 1 << 1  # E-ring edges
-L_RING_T        = 1 << 2  # T-ring edges
-L_ET_TRANSFER   = 1 << 3  # E<->T transfer edges
-L_TGATE_SEA     = 1 << 4  # T-gate -> sea connectors
-L_GATEWAY       = 1 << 5  # reserved: canals/straits corridors (Suez/Panama/etc.)
-L_NE_CORRIDOR   = 1 << 6  # reserved: Northeast / NSR corridors
-L_NW_CORRIDOR   = 1 << 7  # reserved: Northwest corridors
-L_INJECT        = 1 << 8  # injected query edges (Q:START/Q:END -> picks)
-
-# Ban bits: edge carries "potential ban reasons". Policy chooses which bans are active.
-B_HIGH_LAT      = 1 << 0  # max(|lat_u|,|lat_v|) > hard cap
-B_ECA           = 1 << 1  # reserved: Emission Control Areas
-B_ICE           = 1 << 2  # reserved: ice/seasonal restrictions
-B_SHALLOW       = 1 << 3  # reserved: bathymetry/draft limits
-B_TSS           = 1 << 4  # reserved: traffic separation schemes
-B_USER_NO_GO    = 1 << 5  # reserved: user-defined no-go polygons
-
+B_HIGH_LAT      = 1 << 0
 
 def infer_layer_mask_from_etype(etype: str) -> int:
-    """Best-effort mapping from `etype` to layer bits.
-    Unknown types fall back to `L_BASE_SEA`.
-    """
     e = (etype or "").upper()
-    if e in ("E_RING", "E-RING"):
-        return L_RING_E
-    if e in ("T_RING", "T-RING"):
-        return L_RING_T
-    if e in ("E_T", "ET", "E_T_RAMP", "E_T_TRANSFER"):
-        return L_ET_TRANSFER
-    if e in ("T_S_GATE", "TGATE_SEA", "T_GATE_SEA", "T_S"):
-        return L_TGATE_SEA
-    if e in ("INJECT",):
-        return L_INJECT
-    # default: treat as base sea
+    if e in ("E_RING", "E-RING"): return L_RING_E
+    if e in ("T_RING", "T-RING"): return L_RING_T
+    if e in ("E_T", "ET", "E_T_RAMP", "E_T_TRANSFER"): return L_ET_TRANSFER
+    if e in ("T_S_GATE", "TGATE_SEA", "T_GATE_SEA", "T_S"): return L_TGATE_SEA
+    if e in ("INJECT",): return L_INJECT
     return L_BASE_SEA
 
-
 def edge_lat_max_abs(G: nx.Graph, u: str, v: str) -> Optional[float]:
-    """Return max(|lat_u|, |lat_v|) if node attrs exist."""
     try:
         lat_u = float(G.nodes[u].get("lat"))
         lat_v = float(G.nodes[v].get("lat"))
         return float(max(abs(lat_u), abs(lat_v)))
-    except Exception:
+    except:
         return None
 
-
 def compute_edge_masks(G: nx.Graph, u: str, v: str, *, etype: str, hard_lat_cap_deg: float = 70.0) -> Tuple[int, int, Optional[float]]:
-    """Compute (layer_mask, ban_mask, lat_max_abs) for an edge."""
     layer = infer_layer_mask_from_etype(etype)
     lat_max = edge_lat_max_abs(G, u, v)
     ban = 0
-    if lat_max is not None and float(lat_max) > float(hard_lat_cap_deg):
+    if lat_max is not None and lat_max > float(hard_lat_cap_deg):
         ban |= B_HIGH_LAT
-    return int(layer), int(ban), (float(lat_max) if lat_max is not None else None)
-
-
-
+    return int(layer), int(ban), lat_max
 
 # -------------------------
 # Helpers
 # -------------------------
-
-def _wrap_dlon_deg(dlon: float) -> float:
-    # shortest signed delta in degrees
-    return (float(dlon) + 180.0) % 360.0 - 180.0
-
-
 def haversine_km(a: LonLat, b: LonLat) -> float:
-    """Haversine distance (km) with dateline-safe delta-lon."""
     lon1, lat1 = float(a[0]), float(a[1])
     lon2, lat2 = float(b[0]), float(b[1])
-
-    r = 6371.0088  # mean earth radius (km)
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(_wrap_dlon_deg(lon2 - lon1))
-
-    s = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
-    return float(2.0 * r * math.asin(min(1.0, math.sqrt(s))))
-
+    r = 6371.0088
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians((lon2 - lon1 + 180) % 360 - 180)
+    s = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return 2 * r * math.asin(min(1.0, math.sqrt(s)))
 
 def _df(out: Dict[str, Any], key: str) -> Optional[pd.DataFrame]:
     x = out.get(key)
     return x if isinstance(x, pd.DataFrame) else None
-
 
 def _ring_df(out: Dict[str, Any], key: str) -> Optional[pd.DataFrame]:
     rg = out.get("ring_graph", {}) or {}
     x = rg.get(key)
     return x if isinstance(x, pd.DataFrame) else None
 
-
-# -------------------------
-# Stats
-# -------------------------
-
 @dataclass
 class GraphBuildStats:
     sea_edges_added: int = 0
-    cc_edges_added: int = 0
-    gateb_sea_edges_added: int = 0
-    c_gateb_edges_added: int = 0
-
     e_edges_added: int = 0
     t_edges_added: int = 0
     et_edges_added: int = 0
     tgate_sea_edges_added: int = 0
 
-
 # -------------------------
-# Main
+# Main Builder
 # -------------------------
-
 def build_base_graph(
     out: Dict[str, Any],
     *,
     include_sea: bool = True,
-    include_cc: bool = False,
-    include_gateb_sea: bool = False,
-    include_c_gateb: bool = False,
     include_rings: bool = True,
     include_et: bool = True,
     include_tgate_sea: bool = True,
     max_sea_edges: Optional[int] = None,
-    max_cc_edges: Optional[int] = None,
     max_ring_edges: Optional[int] = None,
-    weight_unit: str="km",
+    weight_unit: str = "km",
     bbox_ll: Optional[Tuple[float, float, float, float]] = None,
     hard_lat_cap_deg: float = 70.0,
 ) -> Tuple[nx.Graph, GraphBuildStats]:
-    """Assemble a NetworkX undirected graph from `out` using node_id keys."""
-
     stats = GraphBuildStats()
     G = nx.Graph()
 
-    # -------- Sea nodes + edges --------
+    # 1. Sea
     if include_sea:
         S_nodes = _df(out, "S_nodes")
         S_edges = out.get("S_edges")
-
         if isinstance(S_nodes, pd.DataFrame) and len(S_nodes):
-            # add sea nodes with attrs
             for r in S_nodes.itertuples(index=False):
                 nid = str(getattr(r, "node_id"))
-                lon = float(getattr(r, "lon"))
-                lat = float(getattr(r, "lat"))
-                G.add_node(nid, lon=wrap_lon(lon), lat=lat, kind="sea")
-                if hasattr(r, "x_m") and hasattr(r, "y_m"):
-                    G.nodes[nid]["x_m"] = float(getattr(r, "x_m"))
-                    G.nodes[nid]["y_m"] = float(getattr(r, "y_m"))
-
-        if S_edges is not None and isinstance(S_edges, (list, tuple)) and len(S_edges):
-            take = list(S_edges)
-            if max_sea_edges is not None and len(take) > int(max_sea_edges):
-                take = take[: int(max_sea_edges)]
-
-            for e in take:
-                if not (isinstance(e, (tuple, list)) and len(e) == 2):
-                    continue
-                a, b = e
-                if not (isinstance(a, (tuple, list)) and len(a) == 2 and isinstance(b, (tuple, list)) and len(b) == 2):
-                    continue
-                a_ll = (float(a[0]), float(a[1]))
-                b_ll = (float(b[0]), float(b[1]))
-                u = coord_id(a_ll[0], a_ll[1], prefix="S:")
-                v = coord_id(b_ll[0], b_ll[1], prefix="S:")
-                w = haversine_km(a_ll, b_ll)
+                G.add_node(nid, lon=wrap_lon(getattr(r, "lon")), lat=getattr(r, "lat"), kind="sea")
+                if hasattr(r, "x_m"): G.nodes[nid]["x_m"] = getattr(r, "x_m")
+                if hasattr(r, "y_m"): G.nodes[nid]["y_m"] = getattr(r, "y_m")
+        if S_edges:
+            take = list(S_edges)[:max_sea_edges] if max_sea_edges else S_edges
+            for a, b in take:
+                u, v = coord_id(a[0], a[1], prefix="S:"), coord_id(b[0], b[1], prefix="S:")
+                w = haversine_km(a, b)
                 layer, ban, lat_max = compute_edge_masks(G, u, v, etype="sea", hard_lat_cap_deg=hard_lat_cap_deg)
                 G.add_edge(u, v, weight=w, length_km=w, etype="sea", layer_mask=layer, ban_mask=ban, lat_max_abs=lat_max)
                 stats.sea_edges_added += 1
 
-    # -------- Ring nodes + edges (E/T) --------
+    # 2. Rings
     if include_rings:
-        E_nodes = _ring_df(out, "E_nodes")
-        T_nodes = _ring_df(out, "T_nodes")
-        E_edges = _ring_df(out, "E_edges")
-        T_edges = _ring_df(out, "T_edges")
+        for prefix, tag in [("E", "E_nodes"), ("T", "T_nodes")]:
+            df = _ring_df(out, tag)
+            if isinstance(df, pd.DataFrame):
+                for r in df.itertuples(index=False):
+                    nid = str(getattr(r, "node_key"))
+                    G.add_node(nid, lon=wrap_lon(getattr(r, "lon")), lat=getattr(r, "lat"), kind=f"{prefix}_ring")
+                    if hasattr(r, "x_m"): G.nodes[nid]["x_m"] = getattr(r, "x_m")
+                    if hasattr(r, "y_m"): G.nodes[nid]["y_m"] = getattr(r, "y_m")
 
-        def _add_ring_nodes(df: Optional[pd.DataFrame], prefix: str):
-            if not isinstance(df, pd.DataFrame) or not len(df):
-                return
-            if "node_key" not in df.columns and "node_id" in df.columns:
-                df = df.copy()
-                df["node_key"] = df["node_id"].map(lambda i: f"{prefix}:{int(i)}")
-            for r in df.itertuples(index=False):
-                nid = str(getattr(r, "node_key"))
-                lon = float(getattr(r, "lon"))
-                lat = float(getattr(r, "lat"))
-                G.add_node(nid, lon=wrap_lon(lon), lat=lat, kind=("E_ring" if prefix == "E" else "T_ring"))
-                if hasattr(r, "x_m") and hasattr(r, "y_m"):
-                    G.nodes[nid]["x_m"] = float(getattr(r, "x_m"))
-                    G.nodes[nid]["y_m"] = float(getattr(r, "y_m"))
+        for prefix, tag, etype, stat_attr in [("E", "E_edges", "E_RING", "e_edges_added"), ("T", "T_edges", "T_RING", "t_edges_added")]:
+            df = _ring_df(out, tag)
+            if isinstance(df, pd.DataFrame):
+                take = df.head(max_ring_edges) if max_ring_edges else df
+                for r in take.itertuples(index=False):
+                    # 容錯處理：檢查是否有 u_key 欄位
+                    u = str(getattr(r, "u_key")) if hasattr(r, "u_key") else f"{prefix}:{int(getattr(r, 'u'))}"
+                    v = str(getattr(r, "v_key")) if hasattr(r, "v_key") else f"{prefix}:{int(getattr(r, 'v'))}"
+                    w = getattr(r, "length_km", None) or haversine_km((G.nodes[u]["lon"], G.nodes[u]["lat"]), (G.nodes[v]["lon"], G.nodes[v]["lat"]))
+                    layer, ban, lat_max = compute_edge_masks(G, u, v, etype=etype, hard_lat_cap_deg=hard_lat_cap_deg)
+                    G.add_edge(u, v, weight=w, length_km=w, etype=etype, layer_mask=layer, ban_mask=ban, lat_max_abs=lat_max)
+                    setattr(stats, stat_attr, getattr(stats, stat_attr) + 1)
 
-        _add_ring_nodes(E_nodes, "E")
-        _add_ring_nodes(T_nodes, "T")
-
-        def _add_ring_edges(df: Optional[pd.DataFrame], prefix: str, etype: str, counter_attr: str):
-            nonlocal stats
-            if not isinstance(df, pd.DataFrame) or not len(df):
-                return
-            take = df
-            if max_ring_edges is not None and len(take) > int(max_ring_edges):
-                take = take.head(int(max_ring_edges))
-            # allow either u_key/v_key or u/v
-            for r in take.itertuples(index=False):
-                if hasattr(r, "u_key") and hasattr(r, "v_key") and getattr(r, "u_key") and getattr(r, "v_key"):
-                    u = str(getattr(r, "u_key"))
-                    v = str(getattr(r, "v_key"))
-                else:
-                    u = f"{prefix}:{int(getattr(r, 'u'))}"
-                    v = f"{prefix}:{int(getattr(r, 'v'))}"
-                # edge length
-                w = None
-                if hasattr(r, "length_km") and getattr(r, "length_km") is not None:
-                    try:
-                        w = float(getattr(r, "length_km"))
-                    except Exception:
-                        w = None
-                if w is None:
-                    # compute from node attrs if possible
-                    if u in G.nodes and v in G.nodes:
-                        a_ll = (float(G.nodes[u]["lon"]), float(G.nodes[u]["lat"]))
-                        b_ll = (float(G.nodes[v]["lon"]), float(G.nodes[v]["lat"]))
-                        w = haversine_km(a_ll, b_ll)
-                    else:
-                        continue
-                layer, ban, lat_max = compute_edge_masks(G, u, v, etype=str(etype), hard_lat_cap_deg=hard_lat_cap_deg)
-                G.add_edge(u, v, weight=w, length_km=w, etype=etype, layer_mask=layer, ban_mask=ban, lat_max_abs=lat_max)
-                setattr(stats, counter_attr, getattr(stats, counter_attr) + 1)
-
-        _add_ring_edges(E_edges, "E", "E_RING", "e_edges_added")
-        _add_ring_edges(T_edges, "T", "T_RING", "t_edges_added")
-
-    # -------- E<->T transfer edges --------
+    # 3. E <-> T Transfer
     if include_et:
         ET = _ring_df(out, "ET_edges")
-        if isinstance(ET, pd.DataFrame) and len(ET):
-            take = ET
-            for r in take.itertuples(index=False):
-                if hasattr(r, "u_key") and hasattr(r, "v_key") and getattr(r, "u_key") and getattr(r, "v_key"):
-                    u = str(getattr(r, "u_key"))
-                    v = str(getattr(r, "v_key"))
-                else:
-                    u = f"E:{int(getattr(r, 'u'))}"
-                    v = f"T:{int(getattr(r, 'v'))}"
-                # cost/length
-                w = None
-                for col in ["cost_km", "length_km", "dist_km"]:
-                    if hasattr(r, col) and getattr(r, col) is not None:
-                        try:
-                            w = float(getattr(r, col))
-                            break
-                        except Exception:
-                            pass
-                if w is None and u in G.nodes and v in G.nodes:
-                    a_ll = (float(G.nodes[u]["lon"]), float(G.nodes[u]["lat"]))
-                    b_ll = (float(G.nodes[v]["lon"]), float(G.nodes[v]["lat"]))
-                    w = haversine_km(a_ll, b_ll)
-                if w is None:
-                    continue
-                etype = str(getattr(r, "etype")) if hasattr(r, "etype") else "E_T"
-                layer, ban, lat_max = compute_edge_masks(G, u, v, etype=str(etype), hard_lat_cap_deg=hard_lat_cap_deg)
+        if isinstance(ET, pd.DataFrame):
+            for r in ET.itertuples(index=False):
+                # 關鍵修正點：
+                u = str(getattr(r, "u_key")) if hasattr(r, "u_key") else f"E:{int(getattr(r, 'u'))}"
+                v = str(getattr(r, "v_key")) if hasattr(r, "v_key") else f"T:{int(getattr(r, 'v'))}"
+                w = getattr(r, "cost_km", 0.0)
+                etype = getattr(r, "etype", "E_T")
+                layer, ban, lat_max = compute_edge_masks(G, u, v, etype=etype, hard_lat_cap_deg=hard_lat_cap_deg)
                 G.add_edge(u, v, weight=w, length_km=w, etype=etype, layer_mask=layer, ban_mask=ban, lat_max_abs=lat_max)
                 stats.et_edges_added += 1
 
-    # -------- T-gate -> Sea connectors --------
+    # 4. T-gate -> Sea
     if include_tgate_sea:
-        dfTG = _df(out, "tgate_sea_connectors")
-        if isinstance(dfTG, pd.DataFrame) and len(dfTG):
+        dfTG = out.get("tgate_sea_connectors")
+        if isinstance(dfTG, pd.DataFrame):
             for r in dfTG.itertuples(index=False):
-                # prefer explicit keys
-                if hasattr(r, "t_node_key") and getattr(r, "t_node_key"):
-                    u = str(getattr(r, "t_node_key"))
-                else:
-                    u = f"T:{int(getattr(r, 't_node_id'))}"
-                if hasattr(r, "sea_node_id") and getattr(r, "sea_node_id"):
-                    v = str(getattr(r, "sea_node_id"))
-                else:
-                    # fallback: use sea_idx to look up node_id
-                    sid = int(getattr(r, "sea_idx"))
-                    S_nodes = _df(out, "S_nodes")
-                    if isinstance(S_nodes, pd.DataFrame) and "node_id" in S_nodes.columns and sid in S_nodes.index:
-                        v = str(S_nodes.loc[sid, "node_id"])
-                    else:
-                        continue
-                w = float(getattr(r, "dist_km")) if hasattr(r, "dist_km") else None
-                if w is None:
-                    # compute
-                    if u in G.nodes and v in G.nodes:
-                        a_ll = (float(G.nodes[u]["lon"]), float(G.nodes[u]["lat"]))
-                        b_ll = (float(G.nodes[v]["lon"]), float(G.nodes[v]["lat"]))
-                        w = haversine_km(a_ll, b_ll)
-                    else:
-                        continue
-                etype = str(getattr(r, "etype")) if hasattr(r, "etype") else "T_S_GATE"
-                layer, ban, lat_max = compute_edge_masks(G, u, v, etype=str(etype), hard_lat_cap_deg=hard_lat_cap_deg)
+                u = str(getattr(r, "t_node_key")) if hasattr(r, "t_node_key") else f"T:{int(getattr(r, 't_node_id'))}"
+                v = str(getattr(r, "sea_node_id"))
+                w = getattr(r, "dist_km", 0.0)
+                etype = getattr(r, "etype", "T_S_GATE")
+                layer, ban, lat_max = compute_edge_masks(G, u, v, etype=etype, hard_lat_cap_deg=hard_lat_cap_deg)
                 G.add_edge(u, v, weight=w, length_km=w, etype=etype, layer_mask=layer, ban_mask=ban, lat_max_abs=lat_max)
                 stats.tgate_sea_edges_added += 1
 
     return G, stats
-
 
 ==================================================
 FILE_PATH: routing_map\scgraph_bridge.py
