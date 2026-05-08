@@ -53,3 +53,20 @@ class RoutingMapConfig:
     sea: SeaConfig = SeaConfig()
     rings: Optional[RingBuildConfig] = None
 
+
+@dataclass
+class NgzRingBuildConfig:
+    """NGZ 專用環建構參數。預設值參考 RingBuildConfig 但 NGZ 通常需要不同 clearance。"""
+    clearance_m: float = 5_000.0
+    ring_sample_km: float = 5.0
+    taut_window_size: int = 16
+    taut_max_tries: int = 8
+    point_fix_step_m: float = 1_000.0
+    point_fix_max_iter: int = 20
+    min_island_area_km2: float = 0.0
+    min_ring_length_km: float = 0.0
+    visibility_k_sea: int = 8
+    visibility_k_land_t: int = 4
+    visibility_max_dist_km: float = 200.0
+    group_merge_eps_m: float = 1_000.0
+
