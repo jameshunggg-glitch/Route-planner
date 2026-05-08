@@ -1,15 +1,18 @@
-"""ngz_smoke_test.py — 獨立 smoke test 給 PR1 的 routing_map.ngz 模組用。
+"""ngz_smoke_test.py — NGZ 模組 smoke test。
 
 執行：
     python ngz_smoke_test.py
 
-不需要 aoi_cache，不依賴既有 build_aoi。每個測試 print PASS/FAIL，最後總結。
+T1~T8：純模組測試，不需 aoi_cache。
+T9~T10：整合測試，需要 aoi_cache/out_global.pkl.gz；若不存在會跳過並印 [SKIP]。
 """
 from __future__ import annotations
 
+import os
 import sys
+import time
 import traceback
-from typing import Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import networkx as nx
 from shapely.geometry import LineString, Polygon
@@ -41,7 +44,11 @@ _RESULTS = []
 def _run(name: str, fn):
     print(f"\n=== {name} ===")
     try:
-        fn()
+        result = fn()
+        if result == "skip":
+            print(f"[SKIP] {name}")
+            _RESULTS.append((name, None, "skipped"))
+            return
         print(f"[PASS] {name}")
         _RESULTS.append((name, True, None))
     except AssertionError as e:
@@ -51,6 +58,54 @@ def _run(name: str, fn):
         print(f"[ERROR] {name}: {type(e).__name__}: {e}")
         traceback.print_exc()
         _RESULTS.append((name, False, f"{type(e).__name__}: {e}"))
+
+
+# ---------------------------------------------------------------------------
+# Cached aoi load (lazy, once)
+# ---------------------------------------------------------------------------
+
+_OUT_CACHE: Dict[str, Any] = {"loaded": False, "out": None, "G_base": None}
+
+
+def _load_aoi_once() -> Optional[Tuple[Dict[str, Any], Any]]:
+    """Returns (out, G_base) tuple, or None if cache missing / failed."""
+    if _OUT_CACHE["loaded"]:
+        out = _OUT_CACHE["out"]
+        if out is None:
+            return None
+        return out, _OUT_CACHE["G_base"]
+    _OUT_CACHE["loaded"] = True
+
+    cache_path = os.path.join("aoi_cache", "out_global.pkl.gz")
+    if not os.path.exists(cache_path):
+        print(f"[setup] {cache_path} 不存在；整合測試會跳過")
+        return None
+
+    print(f"[setup] 載入 aoi cache（可能要 10~30 秒）...")
+    t0 = time.time()
+    try:
+        from routing_map.cache_utils import load_out_cache, ensure_graph_edge_masks
+        import gzip
+        import pickle
+        out = load_out_cache(None, strict=False)
+        if out is None:
+            return None
+        # 載 G_base（pipeline build_base_graph 的呼叫簽章與 routing_graph 不一致，
+        # 是既有 inconsistency；用 cache 走 G_in 路徑跳過 build_base_graph）。
+        with gzip.open(os.path.join("aoi_cache", "G_global.pkl.gz"), "rb") as f:
+            payload = pickle.load(f)
+        G_base = payload.get("G_base") if isinstance(payload, dict) else payload
+        if G_base is not None:
+            ensure_graph_edge_masks(G_base, hard_lat_cap_deg=70.0)
+    except Exception as e:
+        print(f"[setup] 載入失敗：{type(e).__name__}: {e}")
+        traceback.print_exc()
+        return None
+    print(f"[setup] aoi 載入完成（{time.time() - t0:.1f}s）"
+          f"，S_nodes={len(out.get('S_nodes', []))}，G_base={G_base.number_of_nodes() if G_base is not None else None}")
+    _OUT_CACHE["out"] = out
+    _OUT_CACHE["G_base"] = G_base
+    return out, G_base
 
 
 def _bbox(poly_or_polys) -> Tuple[float, float, float, float]:
@@ -240,6 +295,115 @@ def test_t7_apply_ngz_mode():
     assert not res_reloc["inside_origin"], "relocate should clear inside_origin"
 
 
+def test_t9_pipeline_no_op_no_ngz():
+    """退化測試：run_p2p 不傳 ngz_polygons → 與 ngz_polygons=None 結果完全一致。
+
+    需要 aoi_cache/out_global.pkl.gz；若不存在 → SKIP。
+    """
+    loaded = _load_aoi_once()
+    if loaded is None:
+        return "skip"
+    out, G_base = loaded
+    if G_base is None:
+        print("  G_base unavailable; skipping")
+        return "skip"
+
+    from routing_map.pipeline import run_p2p, RunConfig
+
+    origin = (118.0, 22.0)
+    dest = (125.0, 28.0)
+    rc = RunConfig(do_repair=False, do_simplify=True, debug=False)
+
+    # 用 G_in 跳過 build_base_graph（pipeline.py 對 build_base_graph 的呼叫
+    # 簽章不匹配是既有 issue，與本 PR 無關）。每次跑前 copy 圖避免 mutation。
+    res_a = run_p2p(out, origin, dest, run_cfg=rc, G_in=G_base.copy())
+    res_b = run_p2p(out, origin, dest, run_cfg=rc, G_in=G_base.copy(), ngz_polygons=None)
+    res_c = run_p2p(out, origin, dest, run_cfg=rc, G_in=G_base.copy(), ngz_polygons=[])
+
+    assert res_a.error is None, f"baseline error: {res_a.error}"
+    assert res_b.error is None, f"ngz_polygons=None error: {res_b.error}"
+    assert res_c.error is None, f"ngz_polygons=[] error: {res_c.error}"
+
+    # 三者 path_ll_final 與 lengths_km 必須完全一致
+    def _key(res):
+        return (
+            tuple(res.path_ll_final or []),
+            tuple(sorted((res.lengths_km or {}).items())),
+        )
+
+    assert _key(res_a) == _key(res_b), "ngz_polygons=None should match no-arg call"
+    assert _key(res_a) == _key(res_c), "ngz_polygons=[] should match no-arg call"
+
+
+def test_t10_simplifier_no_shortcut_through_ngz():
+    """關鍵測試：路徑經過 NGZ 區域時，simplifier 不該抄捷徑穿越 NGZ。
+
+    NGZ function build.md Test 6（必過）。需要 aoi_cache。
+
+    為避免測試 NGZ 跟陸地大量重疊導致差集後變一堆碎片（產生「碎片間合法海峽」誤導
+    判斷），改用開放海域 origin/dest + 純海域 NGZ：
+      - origin (130, 22) → dest (145, 32)  跨太平洋西部
+      - NGZ (135, 25) - (140, 30)  純海域矩形
+    並用「差集後 NGZ 群組 union」（排除 origin/dest 所在 group）做 assertion。
+    """
+    loaded = _load_aoi_once()
+    if loaded is None:
+        return "skip"
+    out, G_base = loaded
+    if G_base is None:
+        return "skip"
+
+    from routing_map.pipeline import run_p2p, RunConfig
+    from routing_map import NgzRingBuildConfig
+
+    origin = (130.0, 22.0)
+    dest = (145.0, 32.0)
+    rc = RunConfig(do_repair=False, do_simplify=True, debug=False)
+
+    # baseline 確認可達
+    res_base = run_p2p(out, origin, dest, run_cfg=rc, G_in=G_base.copy())
+    assert res_base.error is None, f"baseline error: {res_base.error}"
+
+    # NGZ 直接擺在 baseline 中段附近的開放海域
+    ngz_rect = Polygon([(135.0, 25.0), (140.0, 25.0), (140.0, 30.0), (135.0, 30.0)])
+
+    res = run_p2p(
+        out, origin, dest,
+        run_cfg=rc,
+        G_in=G_base.copy(),
+        ngz_polygons=[ngz_rect],
+        ngz_mode="lenient",
+        ngz_cfg=NgzRingBuildConfig(clearance_m=10_000.0),
+    )
+
+    assert res.error is None, f"run_p2p with NGZ failed: {res.error}"
+    assert res.ngz_overlay is not None, "ngz_overlay should be populated"
+    assert len(res.ngz_overlay.groups) >= 1
+    assert len(res.ngz_overlay.nodes) >= 4
+
+    final_path = res.path_ll_final or []
+    assert len(final_path) >= 2, f"final path too short: {len(final_path)}"
+
+    # 關鍵 assertion：final path 不該穿越「實際被視為禁區」的部分。
+    # lenient 模式下 origin/dest 所在 group 從 collision 排除，所以那些不算禁區。
+    exempt = set(res.ngz_inside_origin) | set(res.ngz_inside_dest)
+    forbidden_polys = [
+        g.polygon_ll for g in res.ngz_overlay.groups
+        if g.group_id not in exempt and g.polygon_ll is not None and not g.polygon_ll.is_empty
+    ]
+    if not forbidden_polys:
+        # 全部 exempt 是合法狀態（極端 case），跳過 assertion
+        return
+
+    forbidden_union = unary_union(forbidden_polys)
+    line = LineString(final_path)
+    inner = forbidden_union.buffer(-1e-4)  # 容忍 boundary touch
+    crosses = line.intersection(inner)
+    crosses_len_deg = float(crosses.length) if not crosses.is_empty else 0.0
+    assert crosses_len_deg < 1e-3, \
+        f"final path crosses forbidden NGZ interior: length={crosses_len_deg:.6f} deg"
+
+
 def test_t8_collision_geom_exempt():
     """build_ngz_collision_geom 在 exempt_group_ids 模式下會排除指定 group。"""
     r1 = Polygon([(120.0, 22.0), (122.0, 22.0), (122.0, 24.0), (120.0, 24.0)])
@@ -275,19 +439,22 @@ def main() -> int:
     _run("T6 nx.compose immutability", test_t6_nx_compose_does_not_mutate_cached)
     _run("T7 apply_ngz_mode", test_t7_apply_ngz_mode)
     _run("T8 collision exempt", test_t8_collision_geom_exempt)
+    _run("T9 pipeline no-op without NGZ", test_t9_pipeline_no_op_no_ngz)
+    _run("T10 simplifier no shortcut through NGZ", test_t10_simplifier_no_shortcut_through_ngz)
 
     print("\n" + "=" * 50)
     print("Summary")
     print("=" * 50)
-    n_pass = sum(1 for _, ok, _ in _RESULTS if ok)
-    n_fail = len(_RESULTS) - n_pass
+    n_pass = sum(1 for _, ok, _ in _RESULTS if ok is True)
+    n_skip = sum(1 for _, ok, _ in _RESULTS if ok is None)
+    n_fail = sum(1 for _, ok, _ in _RESULTS if ok is False)
     for name, ok, msg in _RESULTS:
-        flag = "PASS" if ok else "FAIL"
+        flag = "PASS" if ok is True else ("SKIP" if ok is None else "FAIL")
         line = f"  [{flag}] {name}"
-        if msg:
+        if msg and ok is False:
             line += f" — {msg}"
         print(line)
-    print(f"\nTotal: {n_pass}/{len(_RESULTS)} passed")
+    print(f"\nTotal: {n_pass} passed, {n_skip} skipped, {n_fail} failed")
     return 0 if n_fail == 0 else 1
 
 

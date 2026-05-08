@@ -31,8 +31,13 @@ L_GATEWAY       = 1 << 5
 L_NE_CORRIDOR   = 1 << 6
 L_NW_CORRIDOR   = 1 << 7
 L_INJECT        = 1 << 8
+# NGZ overlay layers (query-time only, not in cached G_base)
+L_NGZ_RING      = 1 << 9     # NGZ T-ring 連續邊
+L_NGZ_GATE      = 1 << 10    # NGZ 頂點 -> sea / land T 視線邊
+L_NGZ_NGZ_GATE  = 1 << 11    # 兩個 NGZ 之間的視線邊
 
 B_HIGH_LAT      = 1 << 0
+B_NGZ           = 1 << 1     # 既有節點/邊被 NGZ 覆蓋時加上此 ban
 
 def infer_layer_mask_from_etype(etype: str) -> int:
     e = (etype or "").upper()

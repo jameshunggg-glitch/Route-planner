@@ -139,6 +139,43 @@ def _to_ngz_input(item: Union[NgzInput, Polygon, MultiPolygon], idx: int) -> Ngz
     raise TypeError(f"Unsupported NGZ input type: {type(item)!r}")
 
 
+def clip_collision_to_ngz_bbox(
+    collision_m: Optional[Any],
+    ngz_polys_m: Sequence[Any],
+    *,
+    pad_m: float,
+) -> Optional[Any]:
+    """把 metric collision 用 box(NGZ.bbox + pad) 取交集，回傳「local 版」的小 collision。
+
+    動機：global land collision 是含上千 polygon 的 multipolygon，對它做 unary_union /
+    buffer / difference 都很慢。NGZ 的處理範圍只在自身 clearance + visibility 半徑內，
+    遠處的陸地不影響結果。先 clip 成 local 後續所有 shapely 重型操作都跑得快。
+
+    參數 `pad_m` 應大於 `clearance_m + visibility_max_dist_km*1000`，確保 T-ring 與
+    visibility edge 的可達範圍內所有陸地都被保留。
+
+    任何例外都退回原 `collision_m`（保險：寧可慢也不要錯）。
+    """
+    if collision_m is None or getattr(collision_m, "is_empty", True):
+        return collision_m
+    polys = [p for p in ngz_polys_m if p is not None and not getattr(p, "is_empty", True)]
+    if not polys:
+        return collision_m
+    try:
+        u = unary_union(polys)
+        if u is None or u.is_empty:
+            return collision_m
+        minx, miny, maxx, maxy = u.bounds
+        win = box(minx - pad_m, miny - pad_m, maxx + pad_m, maxy + pad_m)
+        clipped = collision_m.intersection(win)
+        if clipped is None or clipped.is_empty:
+            # 範圍內沒陸地也是合法狀態（NGZ 在開闊海域）；回 None 讓後續視為「無 land」
+            return None
+        return clipped
+    except Exception:
+        return collision_m
+
+
 # ---------------------------------------------------------------------------
 # Dateline splitting
 # ---------------------------------------------------------------------------
@@ -798,26 +835,34 @@ def compose_ngz_into_graph(
             lat_max_abs=90.0,
         )
 
-    # 2. nx.compose 合成（不 mutate 原圖；如果第二個有 attr 會覆蓋第一個）
+    # 2. nx.compose 合成（回傳新 Graph 但「邊 attr dict」與 G_cached 共用 reference）
     G_query = nx.compose(G_cached, G_overlay)
 
     # 3. 對 masked 既有節點/邊：把連到該節點的邊加 ban_mask
+    #    關鍵：直接 attr["ban_mask"]= 會 mutate 到 G_cached 共用的 dict，違反規格的
+    #    「不 mutate cached G」精神。改成「先淺拷 attr dict 再用 add_edge 取代」——
+    #    add_edge 在 G_query 上把這條邊重新指向新 dict，G_cached 的原 dict 完全不動。
     inside_origin = inside_ngz_for_origin or set()
     inside_dest = inside_ngz_for_dest or set()
+
+    def _ban_edge(u: Any, v: Any) -> None:
+        if not G_query.has_edge(u, v):
+            return
+        old_attr = G_query[u][v]
+        new_attr = dict(old_attr)
+        new_attr["ban_mask"] = int(new_attr.get("ban_mask", 0) | ban_for_masked)
+        G_query.add_edge(u, v, **new_attr)
 
     if overlay.masked_existing_nodes:
         for n in overlay.masked_existing_nodes:
             if not G_query.has_node(n):
                 continue
             for nbr in list(G_query.neighbors(n)):
-                attr = G_query[n][nbr]
-                attr["ban_mask"] = int(attr.get("ban_mask", 0) | ban_for_masked)
+                _ban_edge(n, nbr)
 
     if overlay.masked_existing_edges:
         for (u, v) in overlay.masked_existing_edges:
-            if G_query.has_edge(u, v):
-                attr = G_query[u][v]
-                attr["ban_mask"] = int(attr.get("ban_mask", 0) | ban_for_masked)
+            _ban_edge(u, v)
 
     # 4. lenient: origin/dest 所在 NGZ 群組的 mask 解除（未實作於 graph，需配合 collision geom 排除）
     #    這裡的 graph mask 只阻擋既有 sea/ring 邊；inside_origin/dest 主要影響 collision geom
@@ -968,4 +1013,5 @@ __all__ = [
     "build_ngz_collision_geom",
     "detect_inside_ngz",
     "apply_ngz_mode",
+    "clip_collision_to_ngz_bbox",
 ]

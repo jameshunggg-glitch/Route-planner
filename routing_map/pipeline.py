@@ -1,23 +1,39 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import networkx as nx
+from shapely.geometry import MultiPolygon, Polygon
+from shapely.ops import unary_union
 
 from .routing_graph import (
     build_base_graph, haversine_km,
     infer_layer_mask_from_etype,
     L_BASE_SEA, L_RING_E, L_RING_T, L_ET_TRANSFER, L_TGATE_SEA, L_GATEWAY, L_NE_CORRIDOR, L_NW_CORRIDOR, L_INJECT,
-    B_HIGH_LAT,
+    L_NGZ_RING, L_NGZ_GATE, L_NGZ_NGZ_GATE,
+    B_HIGH_LAT, B_NGZ,
 )
 from .snap import snap_pair_component_aware, inject_point_edges, compute_multiworld_policies_for_point
 from .repairer import PathRepairer, RepairConfig
 from .path_simplifier import simplify_path_visibility
 from .geom_utils import get_projector, get_collision_metric
+from .config import NgzRingBuildConfig
+from .ngz import (
+    NgzInput, NgzOverlay,
+    apply_ngz_mode,
+    build_ngz_collision_geom,
+    build_ngz_overlay,
+    build_ngz_t_rings,
+    clip_collision_to_ngz_bbox,
+    compose_ngz_into_graph,
+    normalize_ngz_inputs,
+)
+from .geom_utils import geom_to_m as _geom_to_m
 
 LonLat = Tuple[float, float]
 BBoxLL = Tuple[float, float, float, float]
+NgzPolygonInput = Union[Polygon, MultiPolygon, NgzInput]
 
 
 
@@ -39,10 +55,11 @@ class RoutePolicy:
     enable_northwest: bool = False    # NWP/NW corridor (reserved)
 
     # Which ban reasons are enforced right now
-    active_ban_mask: int = B_HIGH_LAT
+    active_ban_mask: int = B_HIGH_LAT | B_NGZ
 
     def enabled_layers_mask(self) -> int:
-        m = (L_BASE_SEA | L_RING_E | L_RING_T | L_ET_TRANSFER | L_TGATE_SEA | L_INJECT)
+        m = (L_BASE_SEA | L_RING_E | L_RING_T | L_ET_TRANSFER | L_TGATE_SEA | L_INJECT
+             | L_NGZ_RING | L_NGZ_GATE | L_NGZ_NGZ_GATE)
         if self.enable_gateways:
             m |= L_GATEWAY
         if self.enable_northeast:
@@ -198,6 +215,11 @@ class RouteResult:
 
     lengths_km: Optional[Dict[str, float]] = None
 
+    # NGZ overlay (only populated when ngz_polygons passed to run_p2p)
+    ngz_overlay: Optional[NgzOverlay] = None
+    ngz_inside_origin: Set[str] = field(default_factory=set)
+    ngz_inside_dest: Set[str] = field(default_factory=set)
+
     # errors
     error: Optional[str] = None
 
@@ -223,6 +245,10 @@ def run_p2p(
     run_cfg: Optional[RunConfig] = None,
     G_in: Optional[Any] = None,
     policy: Optional[RoutePolicy] = None,
+    # NGZ overlay (query-time only; not cached). 不傳 → 與既有行為完全一致。
+    ngz_polygons: Optional[List[NgzPolygonInput]] = None,
+    ngz_mode: Literal["strict", "lenient", "relocate"] = "lenient",
+    ngz_cfg: Optional[NgzRingBuildConfig] = None,
 ) -> RouteResult:
     """End-to-end routing runner for the new Sea + E/T ring graph.
 
@@ -230,6 +256,9 @@ def run_p2p(
     - `out` already comes from build_aoi.
     - `routing_graph.build_base_graph` is the rings-compatible version.
     - snap.py already snaps to sea candidates and injects edges.
+
+    NGZ：傳 `ngz_polygons` 啟用 query-time overlay。`ngz_mode` 控制 origin/dest 落在
+    NGZ 內時的處理（strict raise / lenient 不動 / relocate 移到最近 T-ring 頂點）。
     """
 
     graph_cfg = graph_cfg or GraphConfig(bbox_ll=out.get("bbox_ll"))
@@ -248,7 +277,10 @@ def run_p2p(
     except Exception:
         proj = out.get("proj", None)
 
-    collision_m, _is_prep = get_collision_metric(out, prefer_prepared=True)
+    # 取「未 prep」的 collision 以便後續 union NGZ；後段需要 prep 時 path_simplifier
+    # 與 PathRepairer 內部會自行處理。
+    has_ngz = bool(ngz_polygons)
+    collision_m, _is_prep = get_collision_metric(out, prefer_prepared=not has_ngz)
 
     # build graph
     try:
@@ -280,7 +312,105 @@ def run_p2p(
     except Exception as e:
         res.error = f"graph_build_error: {e}"
         return res
-    
+
+    # ----------------------------------------------------------------------
+    # NGZ overlay (query-time, never cached). Inserted AFTER base graph build.
+    # 不傳 ngz_polygons → 直接走原 pipeline，行為與既有版完全一致。
+    # ----------------------------------------------------------------------
+    if has_ngz:
+        try:
+            ngz_cfg_eff = ngz_cfg or NgzRingBuildConfig()
+            land_collision_m_raw = collision_m
+            if hasattr(land_collision_m_raw, "context"):
+                land_collision_m_raw = land_collision_m_raw.context
+
+            # ── 效能關鍵：把 global land collision clip 成 NGZ-local 版 ──
+            # global multipolygon 含上千 polygon，對它做 unary_union / buffer / difference
+            # 都會耗數十秒。NGZ 處理只在 clearance + visibility 半徑內，遠處陸地不影響。
+            # clip 一次後，下游所有 shapely 重型操作從 O(global) 降到 O(local)。
+            ngz_polys_m_for_bbox = []
+            for p in ngz_polygons or []:
+                poly_ll = p.polygon if isinstance(p, NgzInput) else p
+                if poly_ll is None or poly_ll.is_empty:
+                    continue
+                try:
+                    ngz_polys_m_for_bbox.append(_geom_to_m(poly_ll, proj))
+                except Exception:
+                    continue
+            pad_m = max(
+                float(ngz_cfg_eff.clearance_m) * 2.0,
+                float(ngz_cfg_eff.visibility_max_dist_km) * 1000.0 * 1.5,
+            ) + 5_000.0
+            land_clip_m = clip_collision_to_ngz_bbox(
+                land_collision_m_raw, ngz_polys_m_for_bbox, pad_m=pad_m,
+            )
+
+            ngz_groups = normalize_ngz_inputs(
+                ngz_polygons,
+                proj=proj,
+                land_collision_m=land_clip_m,
+                cfg=ngz_cfg_eff,
+            )
+            ngz_rings = build_ngz_t_rings(
+                ngz_groups,
+                proj=proj,
+                land_collision_m=land_clip_m,
+                cfg=ngz_cfg_eff,
+            )
+            ngz_overlay = build_ngz_overlay(
+                ngz_rings, ngz_groups,
+                proj=proj, out=out, cfg=ngz_cfg_eff,
+                land_collision_m=land_clip_m,
+            )
+
+            mode_res = apply_ngz_mode(origin_ll, dest_ll, ngz_overlay, mode=ngz_mode)
+            origin_ll = mode_res["origin_ll"]
+            dest_ll = mode_res["dest_ll"]
+            res.origin_ll = origin_ll
+            res.dest_ll = dest_ll
+            res.ngz_inside_origin = mode_res["inside_origin"]
+            res.ngz_inside_dest = mode_res["inside_dest"]
+
+            # 合成臨時 G_query；compose 內部已避免 mutate 原 G_cached
+            G = compose_ngz_into_graph(
+                G, ngz_overlay,
+                inside_ngz_for_origin=res.ngz_inside_origin,
+                inside_ngz_for_dest=res.ngz_inside_dest,
+                layer_ring=L_NGZ_RING,
+                layer_gate=L_NGZ_GATE,
+                layer_ngz_ngz=L_NGZ_NGZ_GATE,
+                ban_for_masked=B_NGZ,
+            )
+            res.G = G
+
+            # 後續 repair / simplify 用的 collision = land ∪ NGZ_excluding_exempt
+            # 這裡 land 維持 global（path 可能延伸到 clip 範圍外），但用 binary .union
+            # 取代 unary_union——後者會對 global multipolygon 整個重算，前者走 STRtree 加速。
+            exempt = set(res.ngz_inside_origin) | set(res.ngz_inside_dest)
+            ngz_coll = build_ngz_collision_geom(
+                ngz_rings, ngz_groups, proj=proj, exempt_group_ids=exempt,
+            )
+            ngz_union_m = ngz_coll.get("ngz_union_m")
+            if ngz_union_m is not None and not ngz_union_m.is_empty:
+                if land_collision_m_raw is not None and not getattr(land_collision_m_raw, "is_empty", True):
+                    collision_m = land_collision_m_raw.union(ngz_union_m)
+                else:
+                    collision_m = ngz_union_m
+            res.ngz_overlay = ngz_overlay
+
+            if run_cfg.debug:
+                print(
+                    f"[pipeline][ngz] groups={len(ngz_groups)} rings={len(ngz_rings)} "
+                    f"nodes={len(ngz_overlay.nodes)} edges_ring={len(ngz_overlay.edges_ring)} "
+                    f"edges_gate={len(ngz_overlay.edges_gate)} edges_ngz_ngz={len(ngz_overlay.edges_ngz_ngz)} "
+                    f"masked_nodes={len(ngz_overlay.masked_existing_nodes)} "
+                    f"masked_edges={len(ngz_overlay.masked_existing_edges)} "
+                    f"inside_origin={res.ngz_inside_origin} inside_dest={res.ngz_inside_dest}"
+                )
+        except Exception as e:
+            res.error = f"ngz_overlay_error: {e}"
+            return res
+
     extra = {}
     if getattr(snap_cfg, "force_start_policy", None) is not None:
         extra["start_policy"] = snap_cfg.force_start_policy
@@ -498,6 +628,10 @@ def run_p2p_multiworld(
     run_cfg: Optional[RunConfig] = None,
     G_in: Optional[nx.Graph] = None,
     policy: Optional[RoutePolicy] = None,
+    # NGZ overlay (query-time only; transparently 透傳 給內部 run_p2p)
+    ngz_polygons: Optional[List[NgzPolygonInput]] = None,
+    ngz_mode: Literal["strict", "lenient", "relocate"] = "lenient",
+    ngz_cfg: Optional[NgzRingBuildConfig] = None,
 ) -> RouteResult:
     """
     Multi-worldview runner:
@@ -723,6 +857,9 @@ def run_p2p_multiworld(
             simplify_cfg=simplify_cfg,
             run_cfg=run_cfg,
             G_in=G_run,  # reuse built graph (copied)
+            ngz_polygons=ngz_polygons,
+            ngz_mode=ngz_mode,
+            ngz_cfg=ngz_cfg,
         )
         res.multiworld_combo = combo
 
