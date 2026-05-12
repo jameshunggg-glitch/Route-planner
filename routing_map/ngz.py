@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 import math
-import numpy as np
 import pandas as pd
 import networkx as nx
 
@@ -469,407 +468,11 @@ def build_ngz_t_rings(
 
 
 # ---------------------------------------------------------------------------
-# Overlay (nodes + edges + masks)
+# Internal: node id helper
 # ---------------------------------------------------------------------------
 
 def _node_id(group_id: str, i: int) -> str:
     return f"NGZ:{group_id}:{i}"
-
-
-def build_ngz_overlay(
-    ngz_results: List[NgzRingResult],
-    groups: List[NgzGroup],
-    *,
-    proj: AOIProjector,
-    out: Optional[Dict[str, Any]] = None,
-    cfg: Optional[NgzRingBuildConfig] = None,
-    land_collision_m: Optional[Any] = None,
-) -> NgzOverlay:
-    """產生 NGZ overlay：節點、群組內 ring 邊、視線邊（gate / ngz↔ngz）、既有節點/邊 mask。
-
-    若 `out` 為 None 或缺少 sea/ring data，gate 邊與 mask 留空（PR1 純模組測試用）。
-    """
-    cfg = cfg or NgzRingBuildConfig()
-
-    # ---- 1. 節點 DataFrame ----
-    node_rows: List[Dict[str, Any]] = []
-    for ring in ngz_results:
-        # taut 環是 closed（first == last），輸出為節點時跳過最後重複點
-        pts_m = ring.taut_pts_m
-        pts_ll = ring.taut_pts_ll
-        if pts_m and pts_m[0] == pts_m[-1]:
-            pts_m = pts_m[:-1]
-            pts_ll = pts_ll[:-1]
-        for i, ((xm, ym), (lon, lat)) in enumerate(zip(pts_m, pts_ll)):
-            node_rows.append({
-                "node_id": _node_id(ring.group_id, i),
-                "lon": float(lon),
-                "lat": float(lat),
-                "x_m": float(xm),
-                "y_m": float(ym),
-                "group_id": ring.group_id,
-                "seq": int(i),
-            })
-    nodes_df = pd.DataFrame(node_rows, columns=["node_id", "lon", "lat", "x_m", "y_m", "group_id", "seq"])
-
-    # ---- 2. 群組內 ring 連續邊（L_NGZ_RING）----
-    ring_edge_rows: List[Dict[str, Any]] = []
-    nodes_by_group: Dict[str, List[Dict[str, Any]]] = {}
-    for row in node_rows:
-        nodes_by_group.setdefault(row["group_id"], []).append(row)
-
-    for gid, rows in nodes_by_group.items():
-        rows_sorted = sorted(rows, key=lambda r: r["seq"])
-        n = len(rows_sorted)
-        if n < 2:
-            continue
-        for k in range(n):
-            a = rows_sorted[k]
-            b = rows_sorted[(k + 1) % n]
-            d_km = _haversine_km((a["lon"], a["lat"]), (b["lon"], b["lat"]))
-            ring_edge_rows.append({
-                "u": a["node_id"],
-                "v": b["node_id"],
-                "weight": float(d_km),
-                "length_km": float(d_km),
-                "etype": "ngz_ring",
-                "group_id": gid,
-            })
-    edges_ring_df = pd.DataFrame(ring_edge_rows, columns=["u", "v", "weight", "length_km", "etype", "group_id"])
-
-    # ---- 3. visibility collision: land ∪ all NGZ groups ----
-    coll_pieces: List[Any] = []
-    if land_collision_m is not None and not getattr(land_collision_m, "is_empty", True):
-        coll_pieces.append(land_collision_m)
-    elif out is not None:
-        layers = out.get("layers") if isinstance(out, dict) else None
-        if isinstance(layers, dict) and layers.get("COLLISION_M") is not None:
-            coll_pieces.append(layers["COLLISION_M"])
-    for g in groups:
-        if g.polygon_m is not None and not g.polygon_m.is_empty:
-            coll_pieces.append(g.polygon_m)
-    visibility_collision_m = unary_union(coll_pieces) if coll_pieces else None
-    visibility_prep = prep(visibility_collision_m) if visibility_collision_m is not None else None
-
-    def _seg_visible(p1_m: XY, p2_m: XY) -> bool:
-        if visibility_prep is None:
-            return True
-        seg = LineString([p1_m, p2_m])
-        try:
-            return not bool(visibility_prep.intersects(seg))
-        except Exception:
-            return False
-
-    # ---- 4. NGZ 頂點 → sea node 視線邊（L_NGZ_GATE）----
-    gate_edge_rows: List[Dict[str, Any]] = []
-    if out is not None and isinstance(out, dict):
-        S_nodes = out.get("S_nodes")
-        sea_kdt = out.get("sea_kdt")
-        if S_nodes is not None and sea_kdt is not None and not nodes_df.empty:
-            try:
-                k_sea = max(1, int(cfg.visibility_k_sea))
-                max_d_m = float(cfg.visibility_max_dist_km) * 1000.0
-                S_xy = S_nodes[["x_m", "y_m"]].to_numpy()
-                S_ids = S_nodes["node_id"].tolist()
-                S_lon = S_nodes["lon"].to_numpy()
-                S_lat = S_nodes["lat"].to_numpy()
-                k_query = min(k_sea, len(S_ids))
-                # KDTree 統一介面（支援 sklearn 或 scipy）
-                for _, nrow in nodes_df.iterrows():
-                    qx, qy = float(nrow["x_m"]), float(nrow["y_m"])
-                    idxs = _kdt_query(sea_kdt, qx, qy, k_query)
-                    for j in idxs:
-                        sx, sy = float(S_xy[j, 0]), float(S_xy[j, 1])
-                        d_m = math.hypot(sx - qx, sy - qy)
-                        if d_m > max_d_m:
-                            continue
-                        if not _seg_visible((qx, qy), (sx, sy)):
-                            continue
-                        s_lon, s_lat = float(S_lon[j]), float(S_lat[j])
-                        d_km = _haversine_km((nrow["lon"], nrow["lat"]), (s_lon, s_lat))
-                        gate_edge_rows.append({
-                            "u": nrow["node_id"],
-                            "v": S_ids[j],
-                            "weight": float(d_km),
-                            "length_km": float(d_km),
-                            "etype": "ngz_gate_sea",
-                            "group_id": nrow["group_id"],
-                        })
-            except Exception:
-                # gate 邊失敗不阻塞整體 overlay
-                pass
-
-        # NGZ 頂點 → 陸地 T-ring 頂點視線邊
-        try:
-            ring_graph = out.get("ring_graph")
-            if ring_graph is not None and isinstance(ring_graph, dict):
-                T_nodes = ring_graph.get("T_nodes")
-                if T_nodes is not None and not T_nodes.empty and not nodes_df.empty:
-                    k_land = max(1, int(cfg.visibility_k_land_t))
-                    max_d_m = float(cfg.visibility_max_dist_km) * 1000.0
-                    T_xy = T_nodes[["x_m", "y_m"]].to_numpy()
-                    T_ids = T_nodes.get("node_key", T_nodes.get("node_id")).tolist()
-                    T_lon = T_nodes["lon"].to_numpy()
-                    T_lat = T_nodes["lat"].to_numpy()
-                    k_query = min(k_land, len(T_ids))
-                    if k_query > 0:
-                        try:
-                            from scipy.spatial import cKDTree as _ScipyKDT
-                            t_tree = _ScipyKDT(T_xy)
-                            use_scipy = True
-                        except Exception:
-                            t_tree = None
-                            use_scipy = False
-                        for _, nrow in nodes_df.iterrows():
-                            qx, qy = float(nrow["x_m"]), float(nrow["y_m"])
-                            if use_scipy and t_tree is not None:
-                                _d, idxs = t_tree.query([qx, qy], k=k_query)
-                                idxs = np.atleast_1d(idxs).tolist()
-                            else:
-                                # fallback: brute force
-                                d2 = (T_xy[:, 0] - qx) ** 2 + (T_xy[:, 1] - qy) ** 2
-                                idxs = np.argsort(d2)[:k_query].tolist()
-                            for j in idxs:
-                                tx, ty = float(T_xy[j, 0]), float(T_xy[j, 1])
-                                d_m = math.hypot(tx - qx, ty - qy)
-                                if d_m > max_d_m:
-                                    continue
-                                if not _seg_visible((qx, qy), (tx, ty)):
-                                    continue
-                                t_lon, t_lat = float(T_lon[j]), float(T_lat[j])
-                                d_km = _haversine_km((nrow["lon"], nrow["lat"]), (t_lon, t_lat))
-                                gate_edge_rows.append({
-                                    "u": nrow["node_id"],
-                                    "v": T_ids[j],
-                                    "weight": float(d_km),
-                                    "length_km": float(d_km),
-                                    "etype": "ngz_gate_land_t",
-                                    "group_id": nrow["group_id"],
-                                })
-        except Exception:
-            pass
-    edges_gate_df = pd.DataFrame(
-        gate_edge_rows,
-        columns=["u", "v", "weight", "length_km", "etype", "group_id"],
-    )
-
-    # ---- 5. NGZ ↔ NGZ 視線邊（L_NGZ_NGZ_GATE）----
-    ngz_ngz_rows: List[Dict[str, Any]] = []
-    if not nodes_df.empty and len(groups) >= 2:
-        gids = sorted(nodes_df["group_id"].unique())
-        nodes_by_gid = {gid: nodes_df[nodes_df["group_id"] == gid] for gid in gids}
-        max_d_m = float(cfg.visibility_max_dist_km) * 1000.0
-        for ai in range(len(gids)):
-            for bi in range(ai + 1, len(gids)):
-                a_rows = nodes_by_gid[gids[ai]]
-                b_rows = nodes_by_gid[gids[bi]]
-                a_xy = a_rows[["x_m", "y_m"]].to_numpy()
-                b_xy = b_rows[["x_m", "y_m"]].to_numpy()
-                a_ids = a_rows["node_id"].tolist()
-                b_ids = b_rows["node_id"].tolist()
-                a_lon = a_rows["lon"].to_numpy()
-                a_lat = a_rows["lat"].to_numpy()
-                b_lon = b_rows["lon"].to_numpy()
-                b_lat = b_rows["lat"].to_numpy()
-                # 簡單 O(n*m)：NGZ 數通常小
-                for i in range(len(a_ids)):
-                    for j in range(len(b_ids)):
-                        d_m = math.hypot(a_xy[i, 0] - b_xy[j, 0], a_xy[i, 1] - b_xy[j, 1])
-                        if d_m > max_d_m:
-                            continue
-                        if not _seg_visible(
-                            (float(a_xy[i, 0]), float(a_xy[i, 1])),
-                            (float(b_xy[j, 0]), float(b_xy[j, 1])),
-                        ):
-                            continue
-                        d_km = _haversine_km(
-                            (float(a_lon[i]), float(a_lat[i])),
-                            (float(b_lon[j]), float(b_lat[j])),
-                        )
-                        ngz_ngz_rows.append({
-                            "u": a_ids[i],
-                            "v": b_ids[j],
-                            "weight": float(d_km),
-                            "length_km": float(d_km),
-                            "etype": "ngz_ngz_gate",
-                            "group_id_a": gids[ai],
-                            "group_id_b": gids[bi],
-                        })
-    edges_ngz_ngz_df = pd.DataFrame(
-        ngz_ngz_rows,
-        columns=["u", "v", "weight", "length_km", "etype", "group_id_a", "group_id_b"],
-    )
-
-    # ---- 6. mask 既有節點/邊（用 lon/lat union 與 STRtree 加速可選）----
-    masked_nodes: Set[Any] = set()
-    masked_edges: Set[Tuple[Any, Any]] = set()
-
-    if out is not None and groups:
-        try:
-            ngz_union_ll = unary_union([g.polygon_ll for g in groups if g.polygon_ll is not None])
-            if ngz_union_ll is not None and not ngz_union_ll.is_empty:
-                ngz_union_ll_prep = prep(ngz_union_ll)
-                S_nodes = out.get("S_nodes")
-                if S_nodes is not None and not S_nodes.empty:
-                    for _, n_row in S_nodes.iterrows():
-                        if ngz_union_ll_prep.contains(Point(float(n_row["lon"]), float(n_row["lat"]))):
-                            masked_nodes.add(n_row["node_id"])
-                # 既有 sea_graph 邊 mask
-                sea_graph = out.get("sea_graph")
-                if sea_graph is not None:
-                    id2ll = out.get("id2ll") or {}
-                    for u, v in sea_graph.edges:
-                        ull = id2ll.get(u)
-                        vll = id2ll.get(v)
-                        if ull is None or vll is None:
-                            continue
-                        seg = LineString([ull, vll])
-                        try:
-                            if ngz_union_ll_prep.intersects(seg):
-                                masked_edges.add((u, v))
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
-    return NgzOverlay(
-        groups=list(groups),
-        rings=list(ngz_results),
-        nodes=nodes_df,
-        edges_ring=edges_ring_df,
-        edges_gate=edges_gate_df,
-        edges_ngz_ngz=edges_ngz_ngz_df,
-        masked_existing_nodes=masked_nodes,
-        masked_existing_edges=masked_edges,
-    )
-
-
-def _kdt_query(kdt: Any, x: float, y: float, k: int) -> List[int]:
-    """KDTree 查詢統一介面（支援 sklearn KDTree 與 scipy cKDTree）。"""
-    try:
-        # sklearn 介面
-        if hasattr(kdt, "query") and hasattr(kdt, "valid_metrics"):
-            d, idx = kdt.query(np.array([[x, y]]), k=k)
-            return [int(i) for i in np.atleast_1d(idx[0]).tolist()]
-    except Exception:
-        pass
-    try:
-        # scipy 介面
-        d, idx = kdt.query([x, y], k=k)
-        return [int(i) for i in np.atleast_1d(idx).tolist()]
-    except Exception:
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Compose into graph + collision geom + mode handling
-# ---------------------------------------------------------------------------
-
-def compose_ngz_into_graph(
-    G_cached: nx.Graph,
-    overlay: NgzOverlay,
-    *,
-    inside_ngz_for_origin: Optional[Set[str]] = None,
-    inside_ngz_for_dest: Optional[Set[str]] = None,
-    layer_ring: int = 1 << 9,
-    layer_gate: int = 1 << 10,
-    layer_ngz_ngz: int = 1 << 11,
-    ban_for_masked: int = 1 << 1,
-) -> nx.Graph:
-    """用 nx.compose 把 overlay 合進 cached graph，回傳臨時 G_query。**不 mutate G_cached**。
-
-    Layer / ban mask 預設值對應 NGZ function build.md 的 L_NGZ_RING / L_NGZ_GATE / L_NGZ_NGZ_GATE
-    與待新增的 B_NGZ。PR2 整合 routing_graph.py 後可改傳實際常數。
-    """
-    if overlay is None:
-        return G_cached
-
-    # 1. 建一個只含 overlay 的 subgraph
-    G_overlay = nx.Graph()
-
-    # 節點
-    for _, row in overlay.nodes.iterrows():
-        G_overlay.add_node(
-            row["node_id"],
-            lon=float(row["lon"]),
-            lat=float(row["lat"]),
-            x_m=float(row["x_m"]),
-            y_m=float(row["y_m"]),
-            group_id=str(row["group_id"]),
-            kind="NGZ_T",
-        )
-
-    # ring 邊
-    for _, e in overlay.edges_ring.iterrows():
-        G_overlay.add_edge(
-            e["u"], e["v"],
-            weight=float(e["weight"]),
-            length_km=float(e["length_km"]),
-            etype=str(e["etype"]),
-            layer_mask=int(layer_ring),
-            ban_mask=0,
-            lat_max_abs=90.0,
-        )
-
-    # gate 邊
-    for _, e in overlay.edges_gate.iterrows():
-        G_overlay.add_edge(
-            e["u"], e["v"],
-            weight=float(e["weight"]),
-            length_km=float(e["length_km"]),
-            etype=str(e["etype"]),
-            layer_mask=int(layer_gate),
-            ban_mask=0,
-            lat_max_abs=90.0,
-        )
-
-    # ngz↔ngz 邊
-    for _, e in overlay.edges_ngz_ngz.iterrows():
-        G_overlay.add_edge(
-            e["u"], e["v"],
-            weight=float(e["weight"]),
-            length_km=float(e["length_km"]),
-            etype=str(e["etype"]),
-            layer_mask=int(layer_ngz_ngz),
-            ban_mask=0,
-            lat_max_abs=90.0,
-        )
-
-    # 2. nx.compose 合成（回傳新 Graph 但「邊 attr dict」與 G_cached 共用 reference）
-    G_query = nx.compose(G_cached, G_overlay)
-
-    # 3. 對 masked 既有節點/邊：把連到該節點的邊加 ban_mask
-    #    關鍵：直接 attr["ban_mask"]= 會 mutate 到 G_cached 共用的 dict，違反規格的
-    #    「不 mutate cached G」精神。改成「先淺拷 attr dict 再用 add_edge 取代」——
-    #    add_edge 在 G_query 上把這條邊重新指向新 dict，G_cached 的原 dict 完全不動。
-    inside_origin = inside_ngz_for_origin or set()
-    inside_dest = inside_ngz_for_dest or set()
-
-    def _ban_edge(u: Any, v: Any) -> None:
-        if not G_query.has_edge(u, v):
-            return
-        old_attr = G_query[u][v]
-        new_attr = dict(old_attr)
-        new_attr["ban_mask"] = int(new_attr.get("ban_mask", 0) | ban_for_masked)
-        G_query.add_edge(u, v, **new_attr)
-
-    if overlay.masked_existing_nodes:
-        for n in overlay.masked_existing_nodes:
-            if not G_query.has_node(n):
-                continue
-            for nbr in list(G_query.neighbors(n)):
-                _ban_edge(n, nbr)
-
-    if overlay.masked_existing_edges:
-        for (u, v) in overlay.masked_existing_edges:
-            _ban_edge(u, v)
-
-    # 4. lenient: origin/dest 所在 NGZ 群組的 mask 解除（未實作於 graph，需配合 collision geom 排除）
-    #    這裡的 graph mask 只阻擋既有 sea/ring 邊；inside_origin/dest 主要影響 collision geom
-    #    （見 build_ngz_collision_geom），故此處 graph 不做特殊處理。
-    _ = (inside_origin, inside_dest)
-
-    return G_query
 
 
 def build_ngz_collision_geom(
@@ -903,6 +506,358 @@ def build_ngz_collision_geom(
         "ngz_union_ll_prepared": prep(union_ll) if union_ll is not None and not union_ll.is_empty else None,
         "ngz_union_m_prepared": prep(union_m) if union_m is not None and not union_m.is_empty else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Baseline + Local Patching (新範式)
+# ---------------------------------------------------------------------------
+
+class NgzPatchUnreachableError(RuntimeError):
+    """A 跟 B 在 local visibility graph 中不連通。Stage 3 raise。"""
+
+
+@dataclass
+class BlockedSubpath:
+    """baseline 中跟 NGZ 相交的連續子段。"""
+    start_idx: int            # baseline 中 anchor A 的 index（A 本身 not-blocked）
+    end_idx: int              # baseline 中 anchor B 的 index（B 本身 not-blocked）
+    anchor_a_ll: LonLat
+    anchor_b_ll: LonLat
+    ngz_group_ids: Set[str] = field(default_factory=set)
+
+
+def _is_prepared_geom(g: Any) -> bool:
+    return g is not None and hasattr(g, "context") and not hasattr(g, "buffer")
+
+
+def _to_prep(g: Any) -> Any:
+    if g is None:
+        return None
+    if _is_prepared_geom(g):
+        return g
+    try:
+        if getattr(g, "is_empty", False):
+            return None
+        return prep(g)
+    except Exception:
+        return None
+
+
+def detect_blocked_subpaths(
+    path_ll: List[LonLat],
+    groups: List[NgzGroup],
+    *,
+    exempt_group_ids: Optional[Set[str]] = None,
+) -> List[BlockedSubpath]:
+    """走訪 baseline 每段 (p_i, p_{i+1})；對每個 NGZ group 的 polygon_ll 做 intersects 檢查。
+    把連續 blocked segment 收集成同一個 BlockedSubpath。
+    A = blocked run 之前最後一個 not-blocked 點；B = blocked run 之後第一個 not-blocked 點。
+    exempt 掉的 group 不參與 detection（lenient 模式 origin/dest 所在 NGZ）。
+    """
+    if not path_ll or len(path_ll) < 2 or not groups:
+        return []
+
+    exempt = exempt_group_ids or set()
+    active_groups = [
+        g for g in groups
+        if g.group_id not in exempt
+        and g.polygon_ll is not None
+        and not g.polygon_ll.is_empty
+    ]
+    if not active_groups:
+        return []
+
+    try:
+        union_ll = unary_union([g.polygon_ll for g in active_groups])
+        union_prep = prep(union_ll) if union_ll is not None and not union_ll.is_empty else None
+    except Exception:
+        union_prep = None
+
+    group_preps: List[Tuple[str, Any]] = []
+    for g in active_groups:
+        try:
+            group_preps.append((g.group_id, prep(g.polygon_ll)))
+        except Exception:
+            continue
+
+    n = len(path_ll)
+    blocked_flags: List[bool] = [False] * (n - 1)
+    seg_groups: List[Set[str]] = [set() for _ in range(n - 1)]
+    for i in range(n - 1):
+        a = path_ll[i]
+        b = path_ll[i + 1]
+        # cross-dateline 段視為不可比較（TODO: 未來 PR 處理 dateline patching）
+        if abs(float(a[0]) - float(b[0])) > 180.0:
+            continue
+        seg = LineString([a, b])
+        if union_prep is not None:
+            try:
+                if not union_prep.intersects(seg):
+                    continue
+            except Exception:
+                pass
+        for gid, gp in group_preps:
+            try:
+                if gp.intersects(seg):
+                    blocked_flags[i] = True
+                    seg_groups[i].add(gid)
+            except Exception:
+                continue
+
+    results: List[BlockedSubpath] = []
+    i = 0
+    while i < n - 1:
+        if not blocked_flags[i]:
+            i += 1
+            continue
+        j = i
+        gids: Set[str] = set()
+        while j < n - 1 and blocked_flags[j]:
+            gids.update(seg_groups[j])
+            j += 1
+        # anchor A = baseline[i]（segment i 起點，前一段沒 blocked → 不在 NGZ）
+        # anchor B = baseline[j]（segment j 起點，亦即 blocked run 之後第一個 not-blocked 點）
+        a_idx = i
+        b_idx = j
+        a_ll = path_ll[a_idx]
+        b_ll = path_ll[b_idx]
+        results.append(BlockedSubpath(
+            start_idx=int(a_idx),
+            end_idx=int(b_idx),
+            anchor_a_ll=(float(a_ll[0]), float(a_ll[1])),
+            anchor_b_ll=(float(b_ll[0]), float(b_ll[1])),
+            ngz_group_ids=gids,
+        ))
+        i = j
+
+    return results
+
+
+def build_local_visibility_graph(
+    blocked: BlockedSubpath,
+    groups: List[NgzGroup],
+    rings: List[NgzRingResult],
+    *,
+    collision_ll: Any,
+    pairwise_visibility: bool = False,
+) -> Tuple[nx.Graph, Any, Any]:
+    """Local visibility graph for one BlockedSubpath。
+
+    節點：'A', 'B' + 每 group T-ring 頂點 (id 用既有 _node_id)。
+    邊：
+      - A↔v / B↔v：視線檢查通過 → 加邊（haversine km）
+      - A↔B：直接視線檢查（通常不通；fallback 用）
+      - 每 group 內部 ring 連續邊
+      - pairwise_visibility=True 時加非相鄰 V 兩兩視線邊（預設 False，靠 Stage 5 收尾）
+
+    `collision_ll` 接受 raw 或 prepared geom；anchor 落在 collision 內 → raise
+    NgzPatchUnreachableError("anchor inside collision")。
+    """
+    collision_prep = _to_prep(collision_ll)
+
+    g = nx.Graph()
+    anchor_a_id = "A"
+    anchor_b_id = "B"
+    a_ll = blocked.anchor_a_ll
+    b_ll = blocked.anchor_b_ll
+    g.add_node(anchor_a_id, lon=float(a_ll[0]), lat=float(a_ll[1]))
+    g.add_node(anchor_b_id, lon=float(b_ll[0]), lat=float(b_ll[1]))
+
+    if collision_prep is not None:
+        try:
+            if collision_prep.contains(Point(a_ll[0], a_ll[1])) or \
+               collision_prep.contains(Point(b_ll[0], b_ll[1])):
+                raise NgzPatchUnreachableError(
+                    f"anchor inside collision: A={a_ll} B={b_ll}"
+                )
+        except NgzPatchUnreachableError:
+            raise
+        except Exception:
+            pass
+
+    ring_by_gid = {r.group_id: r for r in rings}
+    vertex_records: List[Tuple[str, int, LonLat, str]] = []  # (gid, seq, ll, node_id)
+    for grp in groups:
+        ring = ring_by_gid.get(grp.group_id)
+        if ring is None or not ring.taut_pts_ll:
+            continue
+        pts_ll = list(ring.taut_pts_ll)
+        if pts_ll and pts_ll[0] == pts_ll[-1]:
+            pts_ll = pts_ll[:-1]
+        for seq, ll in enumerate(pts_ll):
+            nid = _node_id(grp.group_id, seq)
+            g.add_node(nid, lon=float(ll[0]), lat=float(ll[1]),
+                       group_id=grp.group_id, seq=seq)
+            vertex_records.append((grp.group_id, seq, (float(ll[0]), float(ll[1])), nid))
+
+    nodes_by_gid: Dict[str, List[Tuple[int, str, LonLat]]] = {}
+    for (gid, seq, ll, nid) in vertex_records:
+        nodes_by_gid.setdefault(gid, []).append((seq, nid, ll))
+    for gid, rows in nodes_by_gid.items():
+        rows_sorted = sorted(rows, key=lambda r: r[0])
+        n_g = len(rows_sorted)
+        if n_g < 2:
+            continue
+        for k in range(n_g):
+            _, u_id, u_ll = rows_sorted[k]
+            _, v_id, v_ll = rows_sorted[(k + 1) % n_g]
+            d_km = _haversine_km(u_ll, v_ll)
+            g.add_edge(u_id, v_id, weight=float(d_km), etype="ngz_ring", group_id=gid)
+
+    def _seg_blocked(p1: LonLat, p2: LonLat) -> bool:
+        if collision_prep is None:
+            return False
+        return _segment_intersects_collision(p1, p2, collision_prep, None)
+
+    for endpoint_id, endpoint_ll in ((anchor_a_id, a_ll), (anchor_b_id, b_ll)):
+        for (gid, seq, ll, nid) in vertex_records:
+            if _seg_blocked(endpoint_ll, ll):
+                continue
+            d_km = _haversine_km(endpoint_ll, ll)
+            g.add_edge(endpoint_id, nid, weight=float(d_km), etype="ngz_visibility")
+
+    if not _seg_blocked(a_ll, b_ll):
+        d_km = _haversine_km(a_ll, b_ll)
+        g.add_edge(anchor_a_id, anchor_b_id, weight=float(d_km), etype="ngz_visibility")
+
+    if pairwise_visibility and len(vertex_records) >= 2:
+        for i in range(len(vertex_records)):
+            gid_i, seq_i, ll_i, nid_i = vertex_records[i]
+            for j in range(i + 1, len(vertex_records)):
+                gid_j, seq_j, ll_j, nid_j = vertex_records[j]
+                if gid_i == gid_j:
+                    rows = nodes_by_gid.get(gid_i, [])
+                    n_g = len(rows)
+                    diff = abs(seq_i - seq_j)
+                    if diff == 1 or diff == n_g - 1:
+                        continue
+                if _seg_blocked(ll_i, ll_j):
+                    continue
+                if g.has_edge(nid_i, nid_j):
+                    continue
+                d_km = _haversine_km(ll_i, ll_j)
+                g.add_edge(nid_i, nid_j, weight=float(d_km), etype="ngz_visibility")
+
+    return g, anchor_a_id, anchor_b_id
+
+
+def solve_local_patch(
+    g_local: nx.Graph,
+    anchor_a_id: Any,
+    anchor_b_id: Any,
+    *,
+    rings: List[NgzRingResult],
+    anchor_a_ll: LonLat,
+    anchor_b_ll: LonLat,
+) -> List[LonLat]:
+    """跑 nx.shortest_path(weight='weight') 並把 node id 序列翻成 lon/lat 序列。
+
+    NetworkXNoPath → raise NgzPatchUnreachableError（含 anchors）。
+    """
+    try:
+        node_ids = nx.shortest_path(g_local, anchor_a_id, anchor_b_id, weight="weight")
+    except nx.NetworkXNoPath as e:
+        raise NgzPatchUnreachableError(
+            f"A={anchor_a_ll} B={anchor_b_ll} disconnected: {e}"
+        )
+
+    ring_by_gid = {r.group_id: r for r in rings}
+
+    def _resolve(nid: Any) -> LonLat:
+        if nid == anchor_a_id:
+            return anchor_a_ll
+        if nid == anchor_b_id:
+            return anchor_b_ll
+        nd = g_local.nodes.get(nid, {})
+        if isinstance(nd, dict) and "lon" in nd and "lat" in nd:
+            return (float(nd["lon"]), float(nd["lat"]))
+        s = str(nid)
+        if s.startswith("NGZ:"):
+            try:
+                _, gid, seq_str = s.split(":", 2)
+                seq = int(seq_str)
+                ring = ring_by_gid.get(gid)
+                if ring is not None:
+                    pts = list(ring.taut_pts_ll)
+                    if pts and pts[0] == pts[-1]:
+                        pts = pts[:-1]
+                    if 0 <= seq < len(pts):
+                        return (float(pts[seq][0]), float(pts[seq][1]))
+            except Exception:
+                pass
+        raise KeyError(f"cannot resolve lon/lat for node {nid!r}")
+
+    return [_resolve(nid) for nid in node_ids]
+
+
+def apply_patches_to_baseline(
+    baseline_ll: List[LonLat],
+    patches: List[Tuple[int, int, List[LonLat]]],
+) -> List[LonLat]:
+    """把每個 patch 替換進 baseline 對應區段（splice）。
+
+    patches 元素：(start_idx, end_idx, patch_ll)；patch_ll[0] 應 == baseline[start_idx]、
+    patch_ll[-1] 應 == baseline[end_idx]（anchor 一致）。內部依 start_idx 降冪排序避免
+    index shift。最後 dedupe 連續重複點。
+    """
+    if not patches:
+        return [(float(p[0]), float(p[1])) for p in baseline_ll]
+    work: List[LonLat] = [(float(p[0]), float(p[1])) for p in baseline_ll]
+    for start_idx, end_idx, patch_ll in sorted(patches, key=lambda p: p[0], reverse=True):
+        if start_idx < 0 or end_idx >= len(work) or start_idx > end_idx:
+            continue
+        patch_norm = [(float(p[0]), float(p[1])) for p in patch_ll]
+        work[start_idx:end_idx + 1] = patch_norm
+
+    deduped: List[LonLat] = []
+    for pt in work:
+        if not deduped or deduped[-1] != pt:
+            deduped.append(pt)
+    return deduped
+
+
+def build_ngz_overlay_lite(
+    groups: List[NgzGroup],
+    rings: List[NgzRingResult],
+) -> NgzOverlay:
+    """精簡版 overlay：只填 groups + rings + nodes（taut 頂點 DataFrame）；
+    edges_* / masked_* 給空。維持 NgzOverlay dataclass 與 viz / RouteResult 兼容。
+    """
+    node_rows: List[Dict[str, Any]] = []
+    for ring in rings:
+        pts_m = list(ring.taut_pts_m)
+        pts_ll = list(ring.taut_pts_ll)
+        if pts_m and pts_m[0] == pts_m[-1]:
+            pts_m = pts_m[:-1]
+            pts_ll = pts_ll[:-1]
+        for i, ((xm, ym), (lon, lat)) in enumerate(zip(pts_m, pts_ll)):
+            node_rows.append({
+                "node_id": _node_id(ring.group_id, i),
+                "lon": float(lon),
+                "lat": float(lat),
+                "x_m": float(xm),
+                "y_m": float(ym),
+                "group_id": ring.group_id,
+                "seq": int(i),
+            })
+    nodes_df = pd.DataFrame(
+        node_rows,
+        columns=["node_id", "lon", "lat", "x_m", "y_m", "group_id", "seq"],
+    )
+    empty_edges = pd.DataFrame(
+        columns=["u", "v", "weight", "length_km", "etype", "group_id"]
+    )
+    empty_ngz_ngz = pd.DataFrame(
+        columns=["u", "v", "weight", "length_km", "etype", "group_id_a", "group_id_b"]
+    )
+    return NgzOverlay(
+        groups=list(groups),
+        rings=list(rings),
+        nodes=nodes_df,
+        edges_ring=empty_edges.copy(),
+        edges_gate=empty_edges.copy(),
+        edges_ngz_ngz=empty_ngz_ngz,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1005,13 +960,18 @@ __all__ = [
     "NgzRingResult",
     "NgzOverlay",
     "NgzInsideError",
+    "NgzPatchUnreachableError",
+    "BlockedSubpath",
     "split_polygon_at_antimeridian",
     "normalize_ngz_inputs",
     "build_ngz_t_rings",
-    "build_ngz_overlay",
-    "compose_ngz_into_graph",
+    "build_ngz_overlay_lite",
     "build_ngz_collision_geom",
     "detect_inside_ngz",
+    "detect_blocked_subpaths",
+    "build_local_visibility_graph",
+    "solve_local_patch",
+    "apply_patches_to_baseline",
     "apply_ngz_mode",
     "clip_collision_to_ngz_bbox",
 ]

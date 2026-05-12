@@ -11,8 +11,7 @@ from .routing_graph import (
     build_base_graph, haversine_km,
     infer_layer_mask_from_etype,
     L_BASE_SEA, L_RING_E, L_RING_T, L_ET_TRANSFER, L_TGATE_SEA, L_GATEWAY, L_NE_CORRIDOR, L_NW_CORRIDOR, L_INJECT,
-    L_NGZ_RING, L_NGZ_GATE, L_NGZ_NGZ_GATE,
-    B_HIGH_LAT, B_NGZ,
+    B_HIGH_LAT,
 )
 from .snap import snap_pair_component_aware, inject_point_edges, compute_multiworld_policies_for_point
 from .repairer import PathRepairer, RepairConfig
@@ -21,15 +20,20 @@ from .geom_utils import get_projector, get_collision_metric
 from .config import NgzRingBuildConfig
 from .ngz import (
     NgzInput, NgzOverlay,
+    NgzPatchUnreachableError,
     apply_ngz_mode,
+    apply_patches_to_baseline,
+    build_local_visibility_graph,
     build_ngz_collision_geom,
-    build_ngz_overlay,
+    build_ngz_overlay_lite,
     build_ngz_t_rings,
     clip_collision_to_ngz_bbox,
-    compose_ngz_into_graph,
+    detect_blocked_subpaths,
     normalize_ngz_inputs,
+    solve_local_patch,
 )
 from .geom_utils import geom_to_m as _geom_to_m
+from .geom_utils import geom_to_ll as _geom_to_ll
 
 LonLat = Tuple[float, float]
 BBoxLL = Tuple[float, float, float, float]
@@ -55,11 +59,10 @@ class RoutePolicy:
     enable_northwest: bool = False    # NWP/NW corridor (reserved)
 
     # Which ban reasons are enforced right now
-    active_ban_mask: int = B_HIGH_LAT | B_NGZ
+    active_ban_mask: int = B_HIGH_LAT
 
     def enabled_layers_mask(self) -> int:
-        m = (L_BASE_SEA | L_RING_E | L_RING_T | L_ET_TRANSFER | L_TGATE_SEA | L_INJECT
-             | L_NGZ_RING | L_NGZ_GATE | L_NGZ_NGZ_GATE)
+        m = (L_BASE_SEA | L_RING_E | L_RING_T | L_ET_TRANSFER | L_TGATE_SEA | L_INJECT)
         if self.enable_gateways:
             m |= L_GATEWAY
         if self.enable_northeast:
@@ -314,9 +317,15 @@ def run_p2p(
         return res
 
     # ----------------------------------------------------------------------
-    # NGZ overlay (query-time, never cached). Inserted AFTER base graph build.
+    # NGZ pre-compute (query-time, never cached). 新範式：Baseline + Patching。
+    # 此處只做：normalize / T-ring / mode handling / lite overlay / collision 準備。
+    # 真正的 patching 邏輯在 A* 之後（見 NGZ patching block）。
     # 不傳 ngz_polygons → 直接走原 pipeline，行為與既有版完全一致。
     # ----------------------------------------------------------------------
+    ngz_groups: List[Any] = []
+    ngz_rings: List[Any] = []
+    exempt_group_ids: Set[str] = set()
+    collision_ll_for_patch: Any = None  # prepared geom，供 patching 視線檢查重複使用
     if has_ngz:
         try:
             ngz_cfg_eff = ngz_cfg or NgzRingBuildConfig()
@@ -327,7 +336,6 @@ def run_p2p(
             # ── 效能關鍵：把 global land collision clip 成 NGZ-local 版 ──
             # global multipolygon 含上千 polygon，對它做 unary_union / buffer / difference
             # 都會耗數十秒。NGZ 處理只在 clearance + visibility 半徑內，遠處陸地不影響。
-            # clip 一次後，下游所有 shapely 重型操作從 O(global) 降到 O(local)。
             ngz_polys_m_for_bbox = []
             for p in ngz_polygons or []:
                 poly_ll = p.polygon if isinstance(p, NgzInput) else p
@@ -357,11 +365,7 @@ def run_p2p(
                 land_collision_m=land_clip_m,
                 cfg=ngz_cfg_eff,
             )
-            ngz_overlay = build_ngz_overlay(
-                ngz_rings, ngz_groups,
-                proj=proj, out=out, cfg=ngz_cfg_eff,
-                land_collision_m=land_clip_m,
-            )
+            ngz_overlay = build_ngz_overlay_lite(ngz_groups, ngz_rings)
 
             mode_res = apply_ngz_mode(origin_ll, dest_ll, ngz_overlay, mode=ngz_mode)
             origin_ll = mode_res["origin_ll"]
@@ -370,41 +374,40 @@ def run_p2p(
             res.dest_ll = dest_ll
             res.ngz_inside_origin = mode_res["inside_origin"]
             res.ngz_inside_dest = mode_res["inside_dest"]
+            res.ngz_overlay = ngz_overlay
 
-            # 合成臨時 G_query；compose 內部已避免 mutate 原 G_cached
-            G = compose_ngz_into_graph(
-                G, ngz_overlay,
-                inside_ngz_for_origin=res.ngz_inside_origin,
-                inside_ngz_for_dest=res.ngz_inside_dest,
-                layer_ring=L_NGZ_RING,
-                layer_gate=L_NGZ_GATE,
-                layer_ngz_ngz=L_NGZ_NGZ_GATE,
-                ban_for_masked=B_NGZ,
-            )
-            res.G = G
-
-            # 後續 repair / simplify 用的 collision = land ∪ NGZ_excluding_exempt
+            # 後續 simplify 用的 collision = land ∪ NGZ_excluding_exempt
             # 這裡 land 維持 global（path 可能延伸到 clip 範圍外），但用 binary .union
             # 取代 unary_union——後者會對 global multipolygon 整個重算，前者走 STRtree 加速。
-            exempt = set(res.ngz_inside_origin) | set(res.ngz_inside_dest)
+            exempt_group_ids = set(res.ngz_inside_origin) | set(res.ngz_inside_dest)
             ngz_coll = build_ngz_collision_geom(
-                ngz_rings, ngz_groups, proj=proj, exempt_group_ids=exempt,
+                ngz_rings, ngz_groups, proj=proj, exempt_group_ids=exempt_group_ids,
             )
             ngz_union_m = ngz_coll.get("ngz_union_m")
+            ngz_union_ll = ngz_coll.get("ngz_union_ll")
             if ngz_union_m is not None and not ngz_union_m.is_empty:
                 if land_collision_m_raw is not None and not getattr(land_collision_m_raw, "is_empty", True):
                     collision_m = land_collision_m_raw.union(ngz_union_m)
                 else:
                     collision_m = ngz_union_m
-            res.ngz_overlay = ngz_overlay
+
+            # Patching 階段的視線 collision（lon/lat 空間）= local land + NGZ_excluding_exempt
+            # local land（clip 過的小 multipolygon）轉 lon/lat，與 ngz_union_ll 合併、prep 一次。
+            try:
+                pieces_ll: List[Any] = []
+                if land_clip_m is not None and not getattr(land_clip_m, "is_empty", True):
+                    pieces_ll.append(_geom_to_ll(land_clip_m, proj))
+                if ngz_union_ll is not None and not ngz_union_ll.is_empty:
+                    pieces_ll.append(ngz_union_ll)
+                if pieces_ll:
+                    collision_ll_for_patch = unary_union(pieces_ll)
+            except Exception:
+                collision_ll_for_patch = ngz_union_ll
 
             if run_cfg.debug:
                 print(
                     f"[pipeline][ngz] groups={len(ngz_groups)} rings={len(ngz_rings)} "
-                    f"nodes={len(ngz_overlay.nodes)} edges_ring={len(ngz_overlay.edges_ring)} "
-                    f"edges_gate={len(ngz_overlay.edges_gate)} edges_ngz_ngz={len(ngz_overlay.edges_ngz_ngz)} "
-                    f"masked_nodes={len(ngz_overlay.masked_existing_nodes)} "
-                    f"masked_edges={len(ngz_overlay.masked_existing_edges)} "
+                    f"nodes={len(ngz_overlay.nodes)} exempt={exempt_group_ids} "
                     f"inside_origin={res.ngz_inside_origin} inside_dest={res.ngz_inside_dest}"
                 )
         except Exception as e:
@@ -528,9 +531,63 @@ def run_p2p(
         res.error = f"astar_error: {e}"
         return res
 
+    # ----------------------------------------------------------------------
+    # NGZ local patching (Baseline + Patching 新範式).
+    # path_ll_raw 是 NGZ-unaware 的 baseline P0；偵測與 NGZ 相交的子段 → 對每段
+    # 在 {A, B, 相關 T-ring 頂點} 上跑 visibility shortest path → splice 回 baseline。
+    # 無 NGZ 時 (has_ngz=False) 完全跳過，行為與既有版一致。
+    # ----------------------------------------------------------------------
+    if has_ngz and ngz_groups:
+        try:
+            blocked_runs = detect_blocked_subpaths(
+                res.path_ll_raw,
+                ngz_groups,
+                exempt_group_ids=exempt_group_ids,
+            )
+            if run_cfg.debug:
+                print(f"[pipeline][ngz_patch] blocked_runs={len(blocked_runs)}")
+            patches: List[Tuple[int, int, List[LonLat]]] = []
+            for blocked in blocked_runs:
+                relevant_groups = [
+                    g for g in ngz_groups if g.group_id in blocked.ngz_group_ids
+                ]
+                relevant_rings = [
+                    r for r in ngz_rings if r.group_id in blocked.ngz_group_ids
+                ]
+                # 多 NGZ 同段：必須加跨 group 視線邊才能連通 A→B（單一 group 內部
+                # ring 邊已足夠）。詳見 NGZ baseline patch plan.md §6 N5。
+                pairwise_vis = len(blocked.ngz_group_ids) > 1
+                g_local, a_id, b_id = build_local_visibility_graph(
+                    blocked,
+                    relevant_groups,
+                    relevant_rings,
+                    collision_ll=collision_ll_for_patch,
+                    pairwise_visibility=pairwise_vis,
+                )
+                patch_ll = solve_local_patch(
+                    g_local, a_id, b_id,
+                    rings=relevant_rings,
+                    anchor_a_ll=blocked.anchor_a_ll,
+                    anchor_b_ll=blocked.anchor_b_ll,
+                )
+                patches.append((blocked.start_idx, blocked.end_idx, patch_ll))
+            if patches:
+                path_patched = apply_patches_to_baseline(res.path_ll_raw, patches)
+                res.path_ll_raw = path_patched
+                if run_cfg.debug:
+                    print(f"[pipeline][ngz_patch] applied={len(patches)} new_n={len(path_patched)}")
+        except NgzPatchUnreachableError as e:
+            res.error = f"ngz_patch_unreachable: {e}"
+            return res
+        except Exception as e:
+            res.error = f"ngz_patch_error: {e}"
+            return res
+
 # repair
     path_ll_work = res.path_ll_raw
-    if run_cfg.do_repair and repair_cfg is not None and collision_m is not None:
+    # has_ngz 時 skip repair：patched path 含 T-ring lon/lat，沒對應 graph node id，
+    # PathRepairer 吃 path_nodes 餵不下去；且 D5a 已聲明 baseline = pure A*。
+    if run_cfg.do_repair and repair_cfg is not None and collision_m is not None and not has_ngz:
         try:
             rep = PathRepairer(repair_cfg)
             out_rep = rep.repair_path(G, res.path_nodes, collision_m=collision_m, proj=proj)
