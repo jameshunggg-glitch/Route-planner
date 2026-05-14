@@ -740,6 +740,11 @@ def build_local_visibility_graph(
                        group_id=grp.group_id, seq=seq)
             vertex_records.append((grp.group_id, seq, (float(ll[0]), float(ll[1])), nid))
 
+    def _seg_blocked(p1: LonLat, p2: LonLat) -> bool:
+        if collision_prep is None:
+            return False
+        return _segment_intersects_collision(p1, p2, collision_prep, None)
+
     nodes_by_gid: Dict[str, List[Tuple[int, str, LonLat]]] = {}
     for (gid, seq, ll, nid) in vertex_records:
         nodes_by_gid.setdefault(gid, []).append((seq, nid, ll))
@@ -751,13 +756,10 @@ def build_local_visibility_graph(
         for k in range(n_g):
             _, u_id, u_ll = rows_sorted[k]
             _, v_id, v_ll = rows_sorted[(k + 1) % n_g]
+            if _seg_blocked(u_ll, v_ll):  # NGZ taut 可能跨陸地，需視線檢查
+                continue
             d_km = _haversine_km(u_ll, v_ll)
             g.add_edge(u_id, v_id, weight=float(d_km), etype="ngz_ring", group_id=gid)
-
-    def _seg_blocked(p1: LonLat, p2: LonLat) -> bool:
-        if collision_prep is None:
-            return False
-        return _segment_intersects_collision(p1, p2, collision_prep, None)
 
     for endpoint_id, endpoint_ll in ((anchor_a_id, a_ll), (anchor_b_id, b_ll)):
         for (gid, seq, ll, nid) in vertex_records:
