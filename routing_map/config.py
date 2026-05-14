@@ -69,4 +69,5 @@ class NgzRingBuildConfig:
     visibility_k_land_t: int = 4
     visibility_max_dist_km: float = 200.0
     group_merge_eps_m: float = 1_000.0
+    densify_max_deg: float = 0.5  # NEW: pre-projection edge densify segment length (degrees)
 

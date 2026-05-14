@@ -128,6 +128,51 @@ def _haversine_km(p1: LonLat, p2: LonLat) -> float:
     return float(2.0 * R * math.asin(min(1.0, math.sqrt(a))))
 
 
+def _densify_polygon_ll(poly: PolyLike, max_segment_deg: float = 0.5) -> PolyLike:
+    """在 lon/lat polygon 的每條邊上插中間點，確保每段 length ≤ max_segment_deg。
+
+    防止 4-vertex NGZ 矩形在 AEQD 投影後產生長 metric 直線，造成 polygon_m
+    跟 polygon_ll 在地球上對應不同區域（撲克牌彎曲現象）。對已經 dense 的
+    polygon（例如從天氣 grid 出來的）幾乎是 no-op。
+
+    輸入可為 Polygon 或 MultiPolygon。回傳同型別；失敗回原 poly。
+    """
+    if poly is None or poly.is_empty:
+        return poly
+
+    def _densify_ring(coords):
+        coords = list(coords)
+        if len(coords) < 2:
+            return coords
+        result = [coords[0]]
+        for i in range(1, len(coords)):
+            a = coords[i - 1]
+            b = coords[i]
+            dx = b[0] - a[0]
+            dy = b[1] - a[1]
+            length = math.hypot(dx, dy)
+            if length > max_segment_deg:
+                n_sub = int(math.ceil(length / max_segment_deg))
+                for k in range(1, n_sub):
+                    t = k / n_sub
+                    result.append((a[0] + t * dx, a[1] + t * dy))
+            result.append(b)
+        return result
+
+    if isinstance(poly, MultiPolygon):
+        try:
+            return MultiPolygon([_densify_polygon_ll(p, max_segment_deg) for p in poly.geoms])
+        except Exception:
+            return poly
+
+    try:
+        new_ext = _densify_ring(poly.exterior.coords)
+        new_holes = [_densify_ring(h.coords) for h in poly.interiors]
+        return Polygon(new_ext, new_holes)
+    except Exception:
+        return poly
+
+
 def _to_ngz_input(item: Union[NgzInput, Polygon, MultiPolygon], idx: int) -> NgzInput:
     if isinstance(item, NgzInput):
         if not item.ngz_id:
@@ -308,9 +353,14 @@ def normalize_ngz_inputs(
     if not sub_records:
         return []
 
-    # 4. 投影到 metric，再以 unary_union + buffer(group_merge_eps_m/2) 合併連通群組
-    metrics: List[Polygon] = [_ensure_valid(geom_to_m(p, proj)) for (_mid, p) in sub_records]
-    member_ids: List[str] = [mid for (mid, _p) in sub_records]
+    # 4. Densify lon/lat polygon 再投影到 metric。densify 防止 4-vertex 矩形
+    #    AEQD 失真造成 polygon_m / polygon_ll 不對齊（bow 現象）。
+    densified_records = [
+        (mid, _densify_polygon_ll(p, max_segment_deg=cfg.densify_max_deg))
+        for (mid, p) in sub_records
+    ]
+    metrics: List[Polygon] = [_ensure_valid(geom_to_m(p, proj)) for (_mid, p) in densified_records]
+    member_ids: List[str] = [mid for (mid, _p) in densified_records]
 
     eps = float(cfg.group_merge_eps_m)
     buffer_amount = max(0.0, eps / 2.0)
