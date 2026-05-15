@@ -285,6 +285,12 @@ def run_p2p(
     has_ngz = bool(ngz_polygons)
     collision_m, _is_prep = get_collision_metric(out, prefer_prepared=not has_ngz)
 
+    # 永遠保留 land-only collision，供 repair 用（不管 has_ngz）。
+    # has_ngz=True 時，後面 NGZ pre-compute 會覆蓋 collision_m 為 land+NGZ；這份 raw 留給 repair。
+    land_collision_m_raw = collision_m
+    if hasattr(land_collision_m_raw, "context"):
+        land_collision_m_raw = land_collision_m_raw.context
+
     # build graph
     try:
         if G_in is not None:
@@ -329,9 +335,6 @@ def run_p2p(
     if has_ngz:
         try:
             ngz_cfg_eff = ngz_cfg or NgzRingBuildConfig()
-            land_collision_m_raw = collision_m
-            if hasattr(land_collision_m_raw, "context"):
-                land_collision_m_raw = land_collision_m_raw.context
 
             # ── 效能關鍵：把 global land collision clip 成 NGZ-local 版 ──
             # global multipolygon 含上千 polygon，對它做 unary_union / buffer / difference
@@ -531,6 +534,29 @@ def run_p2p(
         res.error = f"astar_error: {e}"
         return res
 
+    # repair（位置：A* 之後、NGZ patching 之前）
+    # has_ngz path 的 baseline 段一樣有 scgraph 精度問題，需要 repair。
+    # collision 用 land-only（不碰 NGZ，由後段 patching 處理）。
+    path_ll_work = res.path_ll_raw
+    if run_cfg.do_repair and repair_cfg is not None and land_collision_m_raw is not None:
+        try:
+            rep = PathRepairer(repair_cfg)
+            out_rep = rep.repair_path(G, res.path_nodes, collision_m=land_collision_m_raw, proj=proj)
+            res.path_ll_repaired = out_rep.path_ll
+            res.repair_stats = out_rep.stats
+            res.repair_debug = getattr(out_rep, "debug", None)
+            path_ll_work = res.path_ll_repaired
+            if run_cfg.debug:
+                failed = getattr(out_rep.stats, "failed_edges", None)
+                if failed is None:
+                    print(f"[pipeline][repair] repaired_edges={out_rep.stats.repaired_edges} colliding={out_rep.stats.colliding_edges}")
+                else:
+                    print(f"[pipeline][repair] repaired_edges={out_rep.stats.repaired_edges} colliding={out_rep.stats.colliding_edges} failed={failed}")
+        except Exception as e:
+            res.path_ll_repaired = path_ll_work
+            if run_cfg.debug:
+                print(f"[pipeline][repair][warn] {e}")
+
     # ----------------------------------------------------------------------
     # NGZ local patching (Baseline + Patching 新範式).
     # path_ll_raw 是 NGZ-unaware 的 baseline P0；偵測與 NGZ 相交的子段 → 對每段
@@ -540,7 +566,7 @@ def run_p2p(
     if has_ngz and ngz_groups:
         try:
             blocked_runs = detect_blocked_subpaths(
-                res.path_ll_raw,
+                path_ll_work,
                 ngz_groups,
                 exempt_group_ids=exempt_group_ids,
             )
@@ -572,8 +598,12 @@ def run_p2p(
                 )
                 patches.append((blocked.start_idx, blocked.end_idx, patch_ll))
             if patches:
-                path_patched = apply_patches_to_baseline(res.path_ll_raw, patches)
+                path_patched = apply_patches_to_baseline(path_ll_work, patches)
+                path_ll_work = path_patched
                 res.path_ll_raw = path_patched
+                # 同步 repaired 到最新「pre-simplify 視圖」，避免 simplify-off 時 core 誤選 pre-patch 值
+                if res.path_ll_repaired is not None:
+                    res.path_ll_repaired = path_patched
                 if run_cfg.debug:
                     print(f"[pipeline][ngz_patch] applied={len(patches)} new_n={len(path_patched)}")
         except NgzPatchUnreachableError as e:
@@ -582,29 +612,6 @@ def run_p2p(
         except Exception as e:
             res.error = f"ngz_patch_error: {e}"
             return res
-
-# repair
-    path_ll_work = res.path_ll_raw
-    # has_ngz 時 skip repair：patched path 含 T-ring lon/lat，沒對應 graph node id，
-    # PathRepairer 吃 path_nodes 餵不下去；且 D5a 已聲明 baseline = pure A*。
-    if run_cfg.do_repair and repair_cfg is not None and collision_m is not None and not has_ngz:
-        try:
-            rep = PathRepairer(repair_cfg)
-            out_rep = rep.repair_path(G, res.path_nodes, collision_m=collision_m, proj=proj)
-            res.path_ll_repaired = out_rep.path_ll
-            res.repair_stats = out_rep.stats
-            res.repair_debug = getattr(out_rep, "debug", None)
-            path_ll_work = res.path_ll_repaired
-            if run_cfg.debug:
-                failed = getattr(out_rep.stats, "failed_edges", None)
-                if failed is None:
-                    print(f"[pipeline][repair] repaired_edges={out_rep.stats.repaired_edges} colliding={out_rep.stats.colliding_edges}")
-                else:
-                    print(f"[pipeline][repair] repaired_edges={out_rep.stats.repaired_edges} colliding={out_rep.stats.colliding_edges} failed={failed}")
-        except Exception as e:
-            res.path_ll_repaired = path_ll_work
-            if run_cfg.debug:
-                print(f"[pipeline][repair][warn] {e}")
 
     # simplify
     if run_cfg.do_simplify and simplify_cfg.enabled and collision_m is not None:
