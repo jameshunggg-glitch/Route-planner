@@ -1,9 +1,12 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
+import logging
 import math
 from shapely.geometry import LineString
 from shapely.prepared import prep
 from .ring_types import RingBuildConfig, XY
+
+_LOG = logging.getLogger(__name__)
 
 
 def _segment_intersects_collision(
@@ -212,7 +215,18 @@ def taut_simplify_closed_ring(
 
     # fallback: return envelope if nothing works
     if best is None:
+        _LOG.warning(
+            "taut_simplify_closed_ring fallback: no_candidates (n_pts_in=%d)",
+            len(pts_closed),
+        )
         return pts_closed, {"ok": False, "reason": "no_candidates"}
+    _LOG.warning(
+        "taut_simplify_closed_ring fallback: fallback_to_envelope "
+        "(n_pts_in=%d, n_pts_out=%d, tries_used=%s)",
+        len(pts_closed),
+        len(best),
+        best_stats.get("tries_used") if best_stats else "?",
+    )
     return best, {
         "ok": False,
         "reason": "fallback_to_envelope",

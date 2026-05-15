@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import networkx as nx
+from shapely.geometry import MultiPolygon, Polygon
+from shapely.ops import unary_union
 
 from .routing_graph import (
     build_base_graph, haversine_km,
@@ -15,9 +17,27 @@ from .snap import snap_pair_component_aware, inject_point_edges, compute_multiwo
 from .repairer import PathRepairer, RepairConfig
 from .path_simplifier import simplify_path_visibility
 from .geom_utils import get_projector, get_collision_metric
+from .config import NgzRingBuildConfig
+from .ngz import (
+    NgzInput, NgzOverlay,
+    NgzPatchUnreachableError,
+    apply_ngz_mode,
+    apply_patches_to_baseline,
+    build_local_visibility_graph,
+    build_ngz_collision_geom,
+    build_ngz_overlay_lite,
+    build_ngz_t_rings,
+    clip_collision_to_ngz_bbox,
+    detect_blocked_subpaths,
+    normalize_ngz_inputs,
+    solve_local_patch,
+)
+from .geom_utils import geom_to_m as _geom_to_m
+from .geom_utils import geom_to_ll as _geom_to_ll
 
 LonLat = Tuple[float, float]
 BBoxLL = Tuple[float, float, float, float]
+NgzPolygonInput = Union[Polygon, MultiPolygon, NgzInput]
 
 
 
@@ -198,6 +218,11 @@ class RouteResult:
 
     lengths_km: Optional[Dict[str, float]] = None
 
+    # NGZ overlay (only populated when ngz_polygons passed to run_p2p)
+    ngz_overlay: Optional[NgzOverlay] = None
+    ngz_inside_origin: Set[str] = field(default_factory=set)
+    ngz_inside_dest: Set[str] = field(default_factory=set)
+
     # errors
     error: Optional[str] = None
 
@@ -223,6 +248,10 @@ def run_p2p(
     run_cfg: Optional[RunConfig] = None,
     G_in: Optional[Any] = None,
     policy: Optional[RoutePolicy] = None,
+    # NGZ overlay (query-time only; not cached). 不傳 → 與既有行為完全一致。
+    ngz_polygons: Optional[List[NgzPolygonInput]] = None,
+    ngz_mode: Literal["strict", "lenient", "relocate"] = "lenient",
+    ngz_cfg: Optional[NgzRingBuildConfig] = None,
 ) -> RouteResult:
     """End-to-end routing runner for the new Sea + E/T ring graph.
 
@@ -230,6 +259,9 @@ def run_p2p(
     - `out` already comes from build_aoi.
     - `routing_graph.build_base_graph` is the rings-compatible version.
     - snap.py already snaps to sea candidates and injects edges.
+
+    NGZ：傳 `ngz_polygons` 啟用 query-time overlay。`ngz_mode` 控制 origin/dest 落在
+    NGZ 內時的處理（strict raise / lenient 不動 / relocate 移到最近 T-ring 頂點）。
     """
 
     graph_cfg = graph_cfg or GraphConfig(bbox_ll=out.get("bbox_ll"))
@@ -248,7 +280,16 @@ def run_p2p(
     except Exception:
         proj = out.get("proj", None)
 
-    collision_m, _is_prep = get_collision_metric(out, prefer_prepared=True)
+    # 取「未 prep」的 collision 以便後續 union NGZ；後段需要 prep 時 path_simplifier
+    # 與 PathRepairer 內部會自行處理。
+    has_ngz = bool(ngz_polygons)
+    collision_m, _is_prep = get_collision_metric(out, prefer_prepared=not has_ngz)
+
+    # 永遠保留 land-only collision，供 repair 用（不管 has_ngz）。
+    # has_ngz=True 時，後面 NGZ pre-compute 會覆蓋 collision_m 為 land+NGZ；這份 raw 留給 repair。
+    land_collision_m_raw = collision_m
+    if hasattr(land_collision_m_raw, "context"):
+        land_collision_m_raw = land_collision_m_raw.context
 
     # build graph
     try:
@@ -280,7 +321,102 @@ def run_p2p(
     except Exception as e:
         res.error = f"graph_build_error: {e}"
         return res
-    
+
+    # ----------------------------------------------------------------------
+    # NGZ pre-compute (query-time, never cached). 新範式：Baseline + Patching。
+    # 此處只做：normalize / T-ring / mode handling / lite overlay / collision 準備。
+    # 真正的 patching 邏輯在 A* 之後（見 NGZ patching block）。
+    # 不傳 ngz_polygons → 直接走原 pipeline，行為與既有版完全一致。
+    # ----------------------------------------------------------------------
+    ngz_groups: List[Any] = []
+    ngz_rings: List[Any] = []
+    exempt_group_ids: Set[str] = set()
+    collision_ll_for_patch: Any = None  # prepared geom，供 patching 視線檢查重複使用
+    if has_ngz:
+        try:
+            ngz_cfg_eff = ngz_cfg or NgzRingBuildConfig()
+
+            # ── 效能關鍵：把 global land collision clip 成 NGZ-local 版 ──
+            # global multipolygon 含上千 polygon，對它做 unary_union / buffer / difference
+            # 都會耗數十秒。NGZ 處理只在 clearance + visibility 半徑內，遠處陸地不影響。
+            ngz_polys_m_for_bbox = []
+            for p in ngz_polygons or []:
+                poly_ll = p.polygon if isinstance(p, NgzInput) else p
+                if poly_ll is None or poly_ll.is_empty:
+                    continue
+                try:
+                    ngz_polys_m_for_bbox.append(_geom_to_m(poly_ll, proj))
+                except Exception:
+                    continue
+            pad_m = max(
+                float(ngz_cfg_eff.clearance_m) * 2.0,
+                float(ngz_cfg_eff.visibility_max_dist_km) * 1000.0 * 1.5,
+            ) + 5_000.0
+            land_clip_m = clip_collision_to_ngz_bbox(
+                land_collision_m_raw, ngz_polys_m_for_bbox, pad_m=pad_m,
+            )
+
+            ngz_groups = normalize_ngz_inputs(
+                ngz_polygons,
+                proj=proj,
+                land_collision_m=land_clip_m,
+                cfg=ngz_cfg_eff,
+            )
+            ngz_rings = build_ngz_t_rings(
+                ngz_groups,
+                proj=proj,
+                land_collision_m=land_clip_m,
+                cfg=ngz_cfg_eff,
+            )
+            ngz_overlay = build_ngz_overlay_lite(ngz_groups, ngz_rings)
+
+            mode_res = apply_ngz_mode(origin_ll, dest_ll, ngz_overlay, mode=ngz_mode)
+            origin_ll = mode_res["origin_ll"]
+            dest_ll = mode_res["dest_ll"]
+            res.origin_ll = origin_ll
+            res.dest_ll = dest_ll
+            res.ngz_inside_origin = mode_res["inside_origin"]
+            res.ngz_inside_dest = mode_res["inside_dest"]
+            res.ngz_overlay = ngz_overlay
+
+            # 後續 simplify 用的 collision = land ∪ NGZ_excluding_exempt
+            # 這裡 land 維持 global（path 可能延伸到 clip 範圍外），但用 binary .union
+            # 取代 unary_union——後者會對 global multipolygon 整個重算，前者走 STRtree 加速。
+            exempt_group_ids = set(res.ngz_inside_origin) | set(res.ngz_inside_dest)
+            ngz_coll = build_ngz_collision_geom(
+                ngz_rings, ngz_groups, proj=proj, exempt_group_ids=exempt_group_ids,
+            )
+            ngz_union_m = ngz_coll.get("ngz_union_m")
+            ngz_union_ll = ngz_coll.get("ngz_union_ll")
+            if ngz_union_m is not None and not ngz_union_m.is_empty:
+                if land_collision_m_raw is not None and not getattr(land_collision_m_raw, "is_empty", True):
+                    collision_m = land_collision_m_raw.union(ngz_union_m)
+                else:
+                    collision_m = ngz_union_m
+
+            # Patching 階段的視線 collision（lon/lat 空間）= local land + NGZ_excluding_exempt
+            # local land（clip 過的小 multipolygon）轉 lon/lat，與 ngz_union_ll 合併、prep 一次。
+            try:
+                pieces_ll: List[Any] = []
+                if land_clip_m is not None and not getattr(land_clip_m, "is_empty", True):
+                    pieces_ll.append(_geom_to_ll(land_clip_m, proj))
+                if ngz_union_ll is not None and not ngz_union_ll.is_empty:
+                    pieces_ll.append(ngz_union_ll)
+                if pieces_ll:
+                    collision_ll_for_patch = unary_union(pieces_ll)
+            except Exception:
+                collision_ll_for_patch = ngz_union_ll
+
+            if run_cfg.debug:
+                print(
+                    f"[pipeline][ngz] groups={len(ngz_groups)} rings={len(ngz_rings)} "
+                    f"nodes={len(ngz_overlay.nodes)} exempt={exempt_group_ids} "
+                    f"inside_origin={res.ngz_inside_origin} inside_dest={res.ngz_inside_dest}"
+                )
+        except Exception as e:
+            res.error = f"ngz_overlay_error: {e}"
+            return res
+
     extra = {}
     if getattr(snap_cfg, "force_start_policy", None) is not None:
         extra["start_policy"] = snap_cfg.force_start_policy
@@ -398,12 +534,14 @@ def run_p2p(
         res.error = f"astar_error: {e}"
         return res
 
-# repair
+    # repair（位置：A* 之後、NGZ patching 之前）
+    # has_ngz path 的 baseline 段一樣有 scgraph 精度問題，需要 repair。
+    # collision 用 land-only（不碰 NGZ，由後段 patching 處理）。
     path_ll_work = res.path_ll_raw
-    if run_cfg.do_repair and repair_cfg is not None and collision_m is not None:
+    if run_cfg.do_repair and repair_cfg is not None and land_collision_m_raw is not None:
         try:
             rep = PathRepairer(repair_cfg)
-            out_rep = rep.repair_path(G, res.path_nodes, collision_m=collision_m, proj=proj)
+            out_rep = rep.repair_path(G, res.path_nodes, collision_m=land_collision_m_raw, proj=proj)
             res.path_ll_repaired = out_rep.path_ll
             res.repair_stats = out_rep.stats
             res.repair_debug = getattr(out_rep, "debug", None)
@@ -418,6 +556,62 @@ def run_p2p(
             res.path_ll_repaired = path_ll_work
             if run_cfg.debug:
                 print(f"[pipeline][repair][warn] {e}")
+
+    # ----------------------------------------------------------------------
+    # NGZ local patching (Baseline + Patching 新範式).
+    # path_ll_raw 是 NGZ-unaware 的 baseline P0；偵測與 NGZ 相交的子段 → 對每段
+    # 在 {A, B, 相關 T-ring 頂點} 上跑 visibility shortest path → splice 回 baseline。
+    # 無 NGZ 時 (has_ngz=False) 完全跳過，行為與既有版一致。
+    # ----------------------------------------------------------------------
+    if has_ngz and ngz_groups:
+        try:
+            blocked_runs = detect_blocked_subpaths(
+                path_ll_work,
+                ngz_groups,
+                exempt_group_ids=exempt_group_ids,
+            )
+            if run_cfg.debug:
+                print(f"[pipeline][ngz_patch] blocked_runs={len(blocked_runs)}")
+            patches: List[Tuple[int, int, List[LonLat]]] = []
+            for blocked in blocked_runs:
+                relevant_groups = [
+                    g for g in ngz_groups if g.group_id in blocked.ngz_group_ids
+                ]
+                relevant_rings = [
+                    r for r in ngz_rings if r.group_id in blocked.ngz_group_ids
+                ]
+                # 多 NGZ 同段：必須加跨 group 視線邊才能連通 A→B（單一 group 內部
+                # ring 邊已足夠）。詳見 NGZ baseline patch plan.md §6 N5。
+                pairwise_vis = len(blocked.ngz_group_ids) > 1
+                g_local, a_id, b_id = build_local_visibility_graph(
+                    blocked,
+                    relevant_groups,
+                    relevant_rings,
+                    collision_ll=collision_ll_for_patch,
+                    pairwise_visibility=pairwise_vis,
+                )
+                patch_ll = solve_local_patch(
+                    g_local, a_id, b_id,
+                    rings=relevant_rings,
+                    anchor_a_ll=blocked.anchor_a_ll,
+                    anchor_b_ll=blocked.anchor_b_ll,
+                )
+                patches.append((blocked.start_idx, blocked.end_idx, patch_ll))
+            if patches:
+                path_patched = apply_patches_to_baseline(path_ll_work, patches)
+                path_ll_work = path_patched
+                res.path_ll_raw = path_patched
+                # 同步 repaired 到最新「pre-simplify 視圖」，避免 simplify-off 時 core 誤選 pre-patch 值
+                if res.path_ll_repaired is not None:
+                    res.path_ll_repaired = path_patched
+                if run_cfg.debug:
+                    print(f"[pipeline][ngz_patch] applied={len(patches)} new_n={len(path_patched)}")
+        except NgzPatchUnreachableError as e:
+            res.error = f"ngz_patch_unreachable: {e}"
+            return res
+        except Exception as e:
+            res.error = f"ngz_patch_error: {e}"
+            return res
 
     # simplify
     if run_cfg.do_simplify and simplify_cfg.enabled and collision_m is not None:
@@ -498,6 +692,10 @@ def run_p2p_multiworld(
     run_cfg: Optional[RunConfig] = None,
     G_in: Optional[nx.Graph] = None,
     policy: Optional[RoutePolicy] = None,
+    # NGZ overlay (query-time only; transparently 透傳 給內部 run_p2p)
+    ngz_polygons: Optional[List[NgzPolygonInput]] = None,
+    ngz_mode: Literal["strict", "lenient", "relocate"] = "lenient",
+    ngz_cfg: Optional[NgzRingBuildConfig] = None,
 ) -> RouteResult:
     """
     Multi-worldview runner:
@@ -723,6 +921,9 @@ def run_p2p_multiworld(
             simplify_cfg=simplify_cfg,
             run_cfg=run_cfg,
             G_in=G_run,  # reuse built graph (copied)
+            ngz_polygons=ngz_polygons,
+            ngz_mode=ngz_mode,
+            ngz_cfg=ngz_cfg,
         )
         res.multiworld_combo = combo
 

@@ -47,3 +47,9 @@ batch_runs/**
 
 # --- Large files / notebooks you don't want in git ---
 251230_routing_net.ipynb
+
+# --- PR description drafts (work notes, not part of repo) ---
+.pr*_body.md
+
+# --- Claude Code local state ---
+.claude/

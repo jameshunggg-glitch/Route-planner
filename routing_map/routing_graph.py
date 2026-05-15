@@ -31,8 +31,11 @@ L_GATEWAY       = 1 << 5
 L_NE_CORRIDOR   = 1 << 6
 L_NW_CORRIDOR   = 1 << 7
 L_INJECT        = 1 << 8
+# bits 9-11 reserved (was: L_NGZ_RING / L_NGZ_GATE / L_NGZ_NGZ_GATE; removed
+# with baseline+patching 範式重設計，NGZ 不再進 graph layer)
 
 B_HIGH_LAT      = 1 << 0
+# bit 1 reserved (was: B_NGZ; removed with baseline+patching 範式重設計)
 
 def infer_layer_mask_from_etype(etype: str) -> int:
     e = (etype or "").upper()

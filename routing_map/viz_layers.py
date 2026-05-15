@@ -692,6 +692,142 @@ def add_connector_layers(
             folium.PolyLine([[a_v[1], a_v[0]], [b_v[1], b_v[0]]], weight=2, opacity=0.85, color="#e6550d").add_to(fg)
         fg.add_to(m)
 
+def add_ngz_layers(
+    m: folium.Map,
+    overlay: Any,  # routing_map.ngz.NgzOverlay
+    *,
+    show: bool = True,
+    show_envelope: bool = False,
+    show_gate: bool = True,
+    show_ngz_ngz: bool = True,
+    show_masked: bool = False,
+    bbox_ll: Optional[BBoxLL] = None,
+    polygon_color: str = "#d62728",
+    taut_color: str = "#9467bd",
+    gate_color: str = "#2ca02c",
+    ngz_ngz_color: str = "#bcbd22",
+) -> None:
+    """為 NGZ overlay 加 folium 圖層（每個 NGZ group 各一組 FeatureGroup）。
+
+    產生的 layer：
+      - NGZ:{group_id}:polygon — 原始（差集後）的 NGZ 多邊形（半透明紅）
+      - NGZ:{group_id}:taut — T-ring 頂點 + 邊（紫線 + marker）
+      - NGZ:{group_id}:gate — NGZ 頂點 ↔ sea / 陸地 T 視線邊（綠色細線）
+      - NGZ:{group_id}:ngz_ngz — 兩 NGZ 之間的視線邊（黃色）
+      - NGZ:masked_existing — 被 NGZ 蓋住的既有 sea_node（debug 用）
+    與既有 _SelectAllNoneControl 相容。
+    """
+    if overlay is None:
+        return
+    if bbox_ll is None:
+        bbox_ll = getattr(m, "_routing_bbox_ll", None)
+
+    # 1. 各 NGZ group 的 polygon 與 T-ring
+    for g in overlay.groups:
+        gid = g.group_id
+        # polygon 圖層
+        try:
+            geojson = folium.FeatureGroup(name=f"NGZ:{gid}:polygon", show=show)
+            polys = []
+            geom = g.polygon_ll
+            if geom is None:
+                pass
+            elif geom.geom_type == "Polygon":
+                polys = [geom]
+            elif geom.geom_type == "MultiPolygon":
+                polys = list(geom.geoms)
+            for p in polys:
+                coords = [[lat, _lon_viz(lon, bbox_ll)] for (lon, lat) in p.exterior.coords]
+                folium.Polygon(
+                    locations=coords,
+                    color=polygon_color, weight=2,
+                    fill=True, fill_color=polygon_color, fill_opacity=0.18,
+                ).add_to(geojson)
+            geojson.add_to(m)
+        except Exception:
+            pass
+
+        # T-ring（taut 頂點 + 連續邊）
+        ring = next((r for r in overlay.rings if r.group_id == gid), None)
+        if ring is not None and ring.taut_pts_ll:
+            fg_taut = folium.FeatureGroup(name=f"NGZ:{gid}:taut", show=show)
+            pts_ll = ring.taut_pts_ll
+            # 邊
+            try:
+                line_coords = [[lat, _lon_viz(lon, bbox_ll)] for (lon, lat) in pts_ll]
+                if len(line_coords) >= 2:
+                    folium.PolyLine(
+                        line_coords, color=taut_color, weight=3, opacity=0.85,
+                    ).add_to(fg_taut)
+            except Exception:
+                pass
+            # 頂點 marker
+            for (lon, lat) in pts_ll:
+                folium.CircleMarker(
+                    [lat, _lon_viz(lon, bbox_ll)], radius=3, color=taut_color,
+                    fill=True, fill_color=taut_color, fill_opacity=0.9,
+                ).add_to(fg_taut)
+            fg_taut.add_to(m)
+
+    # 2. gate 邊（NGZ ↔ sea / 陸地 T-ring）
+    if show_gate and getattr(overlay, "edges_gate", None) is not None and len(overlay.edges_gate) > 0:
+        # 用 (lon,lat) lookup：NGZ 節點 + 既有 sea/T_nodes 都需要對到位置
+        nid2ll: Dict[Any, LonLat] = {}
+        for _, r in overlay.nodes.iterrows():
+            nid2ll[r["node_id"]] = (float(r["lon"]), float(r["lat"]))
+        # 既有 nodes 的 lon/lat 由 graph attr 解析（caller 會在 m._routing_id2ll 裡塞）
+        id2ll_extra = getattr(m, "_routing_id2ll", None) or {}
+        for gid in {row["group_id"] for _, row in overlay.edges_gate.iterrows()}:
+            fg = folium.FeatureGroup(name=f"NGZ:{gid}:gate", show=show)
+            sub = overlay.edges_gate[overlay.edges_gate["group_id"] == gid]
+            for _, e in sub.iterrows():
+                a = nid2ll.get(e["u"]) or id2ll_extra.get(e["u"])
+                b = nid2ll.get(e["v"]) or id2ll_extra.get(e["v"])
+                if a is None or b is None:
+                    continue
+                try:
+                    folium.PolyLine(
+                        [[a[1], _lon_viz(a[0], bbox_ll)], [b[1], _lon_viz(b[0], bbox_ll)]],
+                        color=gate_color, weight=1.5, opacity=0.7,
+                    ).add_to(fg)
+                except Exception:
+                    continue
+            fg.add_to(m)
+
+    # 3. NGZ ↔ NGZ 邊
+    if show_ngz_ngz and getattr(overlay, "edges_ngz_ngz", None) is not None and len(overlay.edges_ngz_ngz) > 0:
+        nid2ll = {row["node_id"]: (float(row["lon"]), float(row["lat"])) for _, row in overlay.nodes.iterrows()}
+        fg = folium.FeatureGroup(name="NGZ:ngz_ngz", show=show)
+        for _, e in overlay.edges_ngz_ngz.iterrows():
+            a = nid2ll.get(e["u"])
+            b = nid2ll.get(e["v"])
+            if a is None or b is None:
+                continue
+            try:
+                folium.PolyLine(
+                    [[a[1], _lon_viz(a[0], bbox_ll)], [b[1], _lon_viz(b[0], bbox_ll)]],
+                    color=ngz_ngz_color, weight=2, opacity=0.8, dash_array="4,4",
+                ).add_to(fg)
+            except Exception:
+                continue
+        fg.add_to(m)
+
+    # 4. masked existing nodes（debug）
+    if show_masked and overlay.masked_existing_nodes:
+        id2ll_extra = getattr(m, "_routing_id2ll", None) or {}
+        if id2ll_extra:
+            fg = folium.FeatureGroup(name=f"NGZ:masked_existing ({len(overlay.masked_existing_nodes)})", show=False)
+            for nid in overlay.masked_existing_nodes:
+                ll = id2ll_extra.get(nid)
+                if ll is None:
+                    continue
+                folium.CircleMarker(
+                    [ll[1], _lon_viz(ll[0], bbox_ll)], radius=4,
+                    color="#ff7f0e", fill=True, fill_color="#ff7f0e", fill_opacity=0.7,
+                ).add_to(fg)
+            fg.add_to(m)
+
+
 def finalize_map(m: folium.Map, *, html_path: str) -> str:
     m.add_child(folium.LayerControl(collapsed=False))
 
@@ -710,5 +846,6 @@ __all__ = [
     "add_sea_layers",
     "add_ring_layers",
     "add_connector_layers",
+    "add_ngz_layers",
     "finalize_map",
 ]
