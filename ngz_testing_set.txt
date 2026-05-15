@@ -1,0 +1,57 @@
+## 測試點
+
+### test set 1
+
+origin_ll = (139, 32)   # 起點 (lon, lat)
+dest_ll   = (131, 23)   # 終點
+
+# 一個矩形 NGZ；你可以改成任意形狀 / 多個 polygon
+ngz_rect = Polygon([
+    (137.5, 31), (140, 29),
+    (132.5, 25), (132.5, 31),
+])
+
+### test set 2
+
+origin_ll = (139, 32)   # 起點 (lon, lat)
+dest_ll   = (131, 23)   # 終點
+
+# 一個矩形 NGZ；你可以改成任意形狀 / 多個 polygon
+ngz_rect = Polygon([
+    (137.5, 33), (137.5, 25),
+    (132.5, 25), (132.5, 31),
+])
+
+### test set 3
+
+origin_ll = (139, 32)   # 起點 (lon, lat)
+dest_ll   = (131, 23)   # 終點
+
+# 一個矩形 NGZ；你可以改成任意形狀 / 多個 polygon
+ngz_rect = Polygon([
+    (137.5, 33), (137.5, 21),
+    (132.5, 21), (132.5, 31),
+])
+
+### test set 4
+
+origin_ll = (139, 32)   # 起點 (lon, lat)
+dest_ll   = (131, 23)   # 終點
+
+# 一個矩形 NGZ；你可以改成任意形狀 / 多個 polygon
+ngz_rect = Polygon([
+    (137.5, 35), (137.5, 21),
+    (132.5, 21), (132.5, 35),
+])
+
+### test set 5 
+
+origin_ll = (139, 32)   # 起點 (lon, lat)
+dest_ll   = (131, 23)   # 終點
+
+# 一個矩形 NGZ；你可以改成任意形狀 / 多個 polygon
+
+ngz_rect = Polygon([
+    (137.5, 31), (140, 29), (137.5, 25),
+    (132.5, 25), (132.5, 31),
+])
